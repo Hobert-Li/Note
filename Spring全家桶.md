@@ -116,5 +116,47 @@ public class ProxyFactory implements MethodInterceptor{
 >
 >事务超时
 
-#### 事务隔离级别（定义了一个事务可能受其他并发事务影响的程度）：
+#### 事务隔离级别（定义了一个事务可能受其他并发事务影响的程度）
+
+TransactionDefinition接口定义了五个表示隔离级别的常量：
+
+- **TransactionDefinition.ISOLATION_DEFAULT：**使用后端数据库默认的隔离级别，MySQL默认采用的REPEATABLE_REAN隔离级别Oracle默认采用的READ_COMMITTED隔离界别；
+- **TransactionDefinition.ISOLATION_READ_UNCOMMITTED：**最低的隔离级别，允许读取尚未提交的数据变更，可能会导致脏读、幻读和不可重读读；
+- **TransactionDefinition.ISOLATION_READ_COMMITTED：**允许读取并发事务已经提交的数据，可以阻止脏读，但是幻读或不可重读读仍有可能发生；
+- **TransactionDefinition.ISOLATION_REPETABLE_READ：**对同一字段的多次读取结果是一致的，除非是被本身事务自己所修改，可以组织脏读和不可重复读，但幻读仍有可能发生。
+- **TransactionDefinition.ISOLATION_SERIALIZABLE：**最高的隔离级别，完全服从ACID的隔离级别。所有的事务一次逐个执行，纸样事物之间就完全不可能产生干扰，也就是说，该级别可以防止胀肚、不可重复读以及幻读。但是这将严重影响程序的性能。
+
+#### 事务传播行为（为了解决业务层方法之间互相调用的事务问题）
+
+支持当前事务的情况：
+
+- TransactionDefinition.PROPAGATION_REQUIRED：如果存在当前事务，则加入该事务；如果当前没有事务，则创建一个新的事务；
+- TransactionDefinition.PROPAGATION_SUPPORTS：如果当前存在事务，则加入该事务；如果当前没有事务，则以非事务的方式继续运行；
+- TransactionDefinition.PROPAGATION_MANDATORY：如果当前存在事务，则计入该事务；如果当前没有事务，则抛出异常。
+
+不支持当前事务的情况：
+
+- TransactionDefinition.PROPAGATION_REQUIRES_NEW：创建一个新的事务，如果当前存在事务，则把当前事务挂起；
+- TransactionDefnition.PROPAGATION_NOT_SUPPORTED：以非事务方式运行，如果当前存在事务，则把当前事务挂起；
+- TransactionDefinition.PROPAGATION_NEVER：以非事务方式运行，如果当前存在事务，则抛出异常。
+
+其他情况：
+
+- TransactionDefinition.PROPAGATION_NESTED：如果当前存在事务，则创建一个事务作为当前事务的嵌套事务来运行；如果当前没有事务，则该取值等价TransactionDefinition.PROPAGATION_REQUIRED。
+
+#### 事务超时属性（一个事务允许执行的最长事件）
+
+超过时间未完成则自动回滚事务。以int值表示，单位是秒。
+
+#### 事务只读属性（对事务资源是否执行只读操作）
+
+只读/读写。如果是只读的事务将其标记则能提高事务处理的性能。以boolean类型表示是否只读。
+
+#### 回滚规则（定义事务回滚规则）
+
+这些规则定义了哪些异常会导致事务回滚而哪些不会。默认是运行时异常会回滚，但可以声明事务在遇到特定的检查型异常时回滚。还可以声明事务遇到特定的异常不回滚。
+
+### TransactionStatus接口
+
+用以记录事务的状态。
 
