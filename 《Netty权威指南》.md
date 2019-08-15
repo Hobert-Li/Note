@@ -258,3 +258,677 @@ public class TimeClient {
 
 由于线程池可以设置消息队列的大小和最大线程数，因此，它的资源占用式可控的，无论多少个客户端并发访问，都不会导致资源的耗尽和宕机。
 
+### 2.2.2 伪异步I/O创建的TimeServer源码分析
+
+```Java
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version xxx
+ * @create 2019/8/14 18:37
+ */
+
+
+public class TimeServer2 {
+    /**
+     *
+     * @param args
+     */
+    public static void main(String[] args) throws IOException {
+        int port = 8080;
+        if (args != null && args.length > 0) {
+            try {
+                port = Integer.valueOf(args[0]);
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+        }
+
+        ServerSocket server = null;
+        try {
+            server = new ServerSocket(port);
+            System.out.println("服务端端口开启：" + port);
+            Socket socket = null;
+            TimeServerHandlerExecutePool singleExecutePool = new TimeServerHandlerExecutePool(50,10000);
+            while (true) {
+                socket = server.accept();
+                singleExecutePool.execute(new TimeServerHandle(socket));
+            }
+        } finally {
+            if (server != null) {
+                System.out.println("服务端关闭");
+                server.close();
+                server = null;
+            }
+        }
+
+    }
+
+}
+
+```
+
+```Java
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * <p>Description:  线程池</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/14 18:40
+ */
+
+
+public class TimeServerHandlerExecutePool {
+
+    private ExecutorService executor;
+
+    public TimeServerHandlerExecutePool(int maxPoolSize,int queueSize) {
+        executor = new ThreadPoolExecutor(Runtime.getRuntime().availableProcessors(),maxPoolSize,120L,
+                TimeUnit.SECONDS,new ArrayBlockingQueue<Runnable>(queueSize));
+    }
+
+    public void execute(Runnable task) {
+        executor.execute(task);
+    }
+}
+
+```
+
+由于底层的通信依然采用同步阻塞模型。因此无法从根本上解决问题。
+
+### 2.2.3 伪异步I/O弊端分析
+
+操作Socket的输入流时，会一直阻塞，知道出现以下情况：
+
+- 有数据可读；
+- 可用数据已经读取完毕；
+- 发生空指针或者I/O异常。
+
+输出流也会阻塞，TCP发送窗口跟接收窗口大小相关，流量控制。如果采用同步I/O会，wirte操作会被无限期阻塞。
+
+阻塞的时间取决于对方I/O线程的处理速度和网络I/O的传输速度。所以不能依赖对方的处理速度进行I/O。
+
+通信对方返回应答时间过程会引起的级联故障：
+
+（1）服务端处理缓慢，返回应答消息耗费60s，平时只需要10ms；
+
+（2）采用伪异步I/O的线程正在读取故障服务节点的响应，由于读取输入流时阻塞的，它将会被同步阻塞60s；
+
+（3）假如所有可用线程都被故障服务器阻塞，那后续所有的I/O消息都将在队列中排队。
+
+（4）由于线程池采用阻塞队列实现，当队列积满之后，后续入队列的操作将被阻塞。
+
+（5）由于前端只有一个Accptor线程接收客户端接入，它被阻塞在线程池的同步阻塞队列之后，新的客户端请求消息将被拒绝，客户端会发生大量的连接超时。
+
+（6）由于所有的连接都超时，调用者会认为系统已经崩溃，无法接收新的请求消息。
+
+## 2.3 NIO编程
+
+本书使用的NIO都指的是非阻塞I/O。
+
+一般来说，低负载、低并发的应用程序可以选择同步I/O以降低编程复杂度；对于高负载、高并发的网络应用，需要使用NIO的非阻塞模式进行开发。
+
+### 2.3.1 NIO类库简介
+
+1. **缓冲区 Buffer**
+
+Buffer是一个对象，包含一些要写入或者要读出的数据。在面向流的I/O种，可以将数据直接写入或者将数据直接读到Stream对象中。
+
+所有读写操作都通过缓冲区进行。
+
+实际上是一个数组。通常为ByteBuffer。
+
+2. **通道 Channel**
+
+双向。流Stream是单向的。通道可以用于读、写或者二者同时进行。
+
+3. **多路复用器 Selector**
+
+Selector会不断地轮询注册在其上的Channel，如果某个Channel上面发生读或者写事件，这个Channe了就处于就绪状态，会被Selector轮询出来，然后通过SelectionKey可以获取就绪Channel的集合，进行后续的I/O操作。
+
+### 2.3.2 NIO服务端序列图
+
+步骤一：打开ServerSocketChannel，用于监听客户端的连接，它是所有客户端连接的父管道；
+
+```Java
+ServerSocketChannel acceptorSvr = ServerSocketChannel.open();
+```
+
+步骤二：绑定监听端口，设置连接为非阻塞模式；
+
+```Java
+acceptorSvr.socket().bind(new InetSocketAddress(InetAddress.getByName("IP"),port));
+acceptorSvr.configureBlocking(false);
+```
+
+步骤三：创建Reactor线程，创建多路复用器并启动线程；
+
+```Java
+Selector selector = Selector.open();
+New Thread(new ReactorTask()).start();
+```
+
+步骤四：将ServerSocketChannel注册到Reactor线程的多路复用器Selector上，监听ACCEPT事件；
+
+```Java
+SelectionKey key = acceptorSvr.register(selector, SelectionKey.OP_ACCEPT, ioHandler);
+```
+
+步骤五：多路复用器在线程run方法的无限循环体内轮询准备就绪的Key；
+
+```Java
+int num = Selector.select();
+Set selectedKeys = selector.selectedKeys();
+Iterator it = selectedKeys.iterator();
+while (it.hasNext()) {
+    SelectionKey key = (SelectionKey) it.next();
+}
+```
+
+步骤六：多路复用监听器听到有新的客户端接入，处理新的接入请求，完成TCP三次握手，建立物理链路；
+
+```Java
+SocketChannel channel = svrChannel.accept();
+```
+
+步骤七：设置客户端链路为非阻塞模式；
+
+```Java
+channel.configureBlocking(false);
+channel.socket().setReuseAddress(true);
+```
+
+步骤八：将新接入的客户端连接注册到Reactor线程的多路复用器上，监听读操作，读取客户端发送的网络消息，示例代码如下；
+
+```java
+SelectionKey key = socketChannel.register(selector, SelectionKey.OP_READ,ioHandler);
+```
+
+步骤九：异步读取客户端请求消息到缓冲区；
+
+```Java
+int readNumber = channel.read(receivedBuffer);
+```
+
+步骤十：对ByteBuffer进行编解码，如果有半包消息指针reset，继续读取后续的报文，将节码成功的消息封装成Task，投递到业务线程池中，进行业务逻辑编排；
+
+```Java
+Object message = null;
+while(buffer.hasRemain()) {
+    byteBuffer.mark();
+    Object message = decode(byteBuffer);
+    if(message == null) {
+        byteBuffer.reset();
+        break;
+    }
+    messageList.add(message);
+}
+if(!byteBuffer.hasRemain()) {
+    byteBuffer.clear();
+} else {
+    byteBuffer.compact();
+} ..........................
+```
+
+步骤十一：将POJO对象encode成Bytebuffer，调用SocketChannel的异步write接口，将消息异步发送到客户端；
+
+```Java
+socketChannel.write(buffer);
+```
+
+### 2.3.3 NIO创建的TimeServer源码分析
+
+```Java
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/15 11:40
+ */
+
+
+public class TimeServer3 {
+    public static void main(String[] args) {
+        int port = 8080;
+        if (args != null && args.length > 0) {
+            try {
+                port = Integer.valueOf(args[0]);
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+        }
+
+        MultiplexerTimeServer timeServer = new MultiplexerTimeServer(port);
+
+        new Thread(timeServer, "NIO-MultiplexerTimeServer-001").start();
+    }
+}
+```
+
+```Java
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.util.Iterator;
+import java.util.Set;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/15 11:42
+ */
+
+
+public class MultiplexerTimeServer implements Runnable{
+
+    private Selector selector;
+
+    private ServerSocketChannel serverSocketChannel;
+
+    private volatile boolean stop;
+
+    public MultiplexerTimeServer(int port) {
+        try {
+            selector = Selector.open();
+            serverSocketChannel = ServerSocketChannel.open();
+            serverSocketChannel.configureBlocking(false);
+            serverSocketChannel.socket().bind(new InetSocketAddress(port),1024);
+            serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT);
+            System.out.println("服务器启动，端口号："+port);
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+
+    public void stop() {
+        this.stop = true;
+    }
+
+    public void run() {
+        while (!stop) {
+            try {
+                selector.select(1000);
+                Set<SelectionKey> selectionKeys = selector.selectedKeys();
+                Iterator<SelectionKey> it = selectionKeys.iterator();
+                SelectionKey key = null;
+                while (it.hasNext()) {
+                    key = it.next();
+                    it.remove();
+                    try {
+                        handleInput(key);
+                    } catch (Exception e) {
+                        if (key != null) {
+                            key.cancel();
+                            if (key.channel() != null) {
+                                key.channel().close();
+                            }
+                        }
+                    }
+
+                }
+            } catch (Throwable t) {
+                t.printStackTrace();
+            }
+        }
+
+        if (selector != null) {
+            try {
+                selector.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private void handleInput(SelectionKey key) throws IOException {
+        if (key.isValid()) {
+            if (key.isAcceptable()) {
+                ServerSocketChannel ssc = (ServerSocketChannel) key.channel();
+                SocketChannel sc = ssc.accept();
+                sc.configureBlocking(false);
+                sc.register(selector,SelectionKey.OP_READ);
+            }
+
+            if (key.isReadable()) {
+                SocketChannel sc = (SocketChannel) key.channel();
+                ByteBuffer readBuffer = ByteBuffer.allocate(1024);
+                int readBytes = sc.read(readBuffer);//非阻塞
+                if (readBytes > 0) {
+                    readBuffer.flip();
+                    byte[] bytes = new byte[readBuffer.remaining()];
+                    readBuffer.get(bytes);
+                    String body = new String(bytes,"UTF-8");
+                    System.out.println("服务器接收到命令："+body);
+                    String currentTime = "time".equalsIgnoreCase(body) ? new java.util.Date(System.currentTimeMillis()).toString() : "命令错误";
+                    doWrite(sc,currentTime);
+                } else if (readBytes < 0) {//返回值等于-1，链路已经关闭
+                    key.cancel();
+                    sc.close();
+                } else {//返回值等于0
+                }
+            }
+        }
+    }
+
+    private void doWrite(SocketChannel channel, String response) throws IOException {
+        if (response != null && response.trim().length() > 0) {//由于SocketChannel是异步非阻塞的，会出现“写半包”问题
+            byte[] bytes = response.getBytes();
+            ByteBuffer writeBuffer = ByteBuffer.allocate(bytes.length);
+            writeBuffer.put(bytes);
+            writeBuffer.flip();
+            channel.write(writeBuffer);
+        }
+    }
+
+}
+```
+
+### 2.3.4 NIO客户端序列图
+
+步骤一：打开SocketChannel，绑定客户端本地地址（可选，默认随机分配）；
+
+```Java
+SocketChannel clientChannel = SocketChannel.open();
+```
+
+步骤二：设置SocketChannel为非阻塞模式，同时设置客户端连接的TCP参数；
+
+```java
+clientChannel.configureBlocking(false);
+socket.setReuseAddress(true);
+socket.setReceiveBufferSize(BUFFER_SIZE);
+socket.setSendBufferSize(BUFFER_SIZE);
+```
+
+步骤三：异步连接服务端；
+
+```java
+boolean connected = clientChannel.connect(new InetSocketAddress("ip",port));
+```
+
+步骤四：判断是否连接成功，如果连接成功，则直接注册读状态位到多路复用器中，如果当前没有连接成功（异步连接，返回false，说明客户端已经发送sync包，服务端没有返回ack包，物理链路还没有建立）；
+
+```java
+if(connectied) {
+    clientChannel.register(selector,Selection.OP_READ,ioHandler);
+} else {
+    clientChannel.register(selector,Selection.OP_CONNECT,ioHandler);
+}
+```
+
+步骤五：向Reactor线程的多路复用器注册OP_CONNECT状态位，监听服务端的TCPACK应答；
+
+```JAVA
+clientChannel.register(selector, Selection.OP_CONNECT, ioHandler);
+```
+
+步骤六：创建Reactor线程，创建多路复用器并启动线程；
+
+```JAVA
+Selector seletor = Selector.open();
+new Thread(new ReactorTask()).start();
+```
+
+步骤七：多路复用器在线程run方法的无限循环体内轮询准备就绪的Key；
+
+```JAVA
+int num = selector.select();
+Set selectedKeys = selector,selectedKeys();
+Irerator it = selectedKeys.iterator();
+while (it.hasNext()) {
+    SelectionKey key = (SelectionKey) it.next();
+}
+```
+
+步骤八：接收connect事件进行处理；
+
+```Java
+if(key.isConnectable()) {
+    ..
+}
+```
+
+步骤九：判断连接结果，如果连接成功，注册读事件到多路复用器；
+
+```java
+if(channel.finishConnection()) {
+    registerRead();
+}
+```
+
+步骤十：注册读事件到多路复用器；
+
+```Java
+clientChannel.register(selector, SelectionKey.OP_READ, ioHandler);
+```
+
+步骤十一：异步读客户端请求消息到缓冲区；
+
+```Java
+int readNumber = channel.read(receiveBuffer);
+```
+
+步骤十二：对ByteBuffer进行编解码，如果有半包消息接收缓冲区Reset，继续读取后续的报文，将解码成功的消息封装成Task，投递到业务线程池中，进行业务逻辑编排。
+
+略
+
+步骤十三：将POKO对象encode成ByteBuffer，调用SocketChannel的异步write接口，将消息异步发送给客户端。
+
+```Java
+socketChannel.write(buffer);
+```
+
+### 2.3.5 NIO创建的TimeClient源码分析
+
+```java
+package NIO;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/15 14:13
+ */
+
+
+public class TimeClient {
+    public static void main(String[] args) {
+        int port = 8080;
+        if (args != null && args.length > 0) {
+            try {
+                port = Integer.valueOf(args[0]);
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+        }
+
+        new Thread(new TimeClientHandle("127.0.0.1",port),"TimeClient-001").start();
+    }
+}
+```
+
+```java
+package NIO;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
+import java.util.Iterator;
+import java.util.Set;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/15 14:16
+ */
+
+
+public class TimeClientHandle implements Runnable {
+
+    private String host;
+    private int port;
+    private Selector selector;
+    private SocketChannel socketChannel;
+    private volatile boolean stop;
+
+    public TimeClientHandle(String host, int port) {
+        this.host = host == null ? "127.0.0.1" : host;
+        this.port = port;
+        try {
+            selector = Selector.open();
+            socketChannel = SocketChannel.open();
+            socketChannel.configureBlocking(false);
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+
+
+    @Override
+    public void run() {
+        try {
+            doConnect();
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.exit(1);
+        }
+
+        while (!stop) {
+            try {
+                selector.select(1000);
+                Set<SelectionKey> selectionKeys = selector.selectedKeys();
+                Iterator<SelectionKey> it = selectionKeys.iterator();
+                SelectionKey key = null;
+                while (it.hasNext()) {
+                    key = it.next();
+                    it.remove();
+                    try {
+                        handleInput(key);
+                    } catch (IOException e) {
+                        if (key != null) {
+                            key.cancel();
+                            if (key.channel() != null) {
+                                key.channel().close();
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+                System.exit(1);
+            }
+        }
+
+        if (selector != null) {
+            try {
+                selector.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+
+
+    private void handleInput(SelectionKey key) throws IOException {
+        if (key.isValid()) {
+            SocketChannel sc = (SocketChannel) key.channel();
+            if (key.isConnectable()) {
+                if (sc.finishConnect()) {
+                    sc.register(selector, SelectionKey.OP_READ);
+                    doWrite(sc);
+                } else {
+                    System.exit(1);
+                }
+            }
+
+            if (key.isReadable()) {
+                ByteBuffer readBuffer = ByteBuffer.allocate(1024);
+                int readBytes = sc.read(readBuffer);
+                if (readBytes > 0) {
+                    readBuffer.flip();
+                    byte[] bytes = new byte[readBuffer.remaining()];
+                    readBuffer.get(bytes);
+                    String body = new String(bytes,"UTF-8");
+                    System.out.println("现在时间：" + body);
+                    this.stop = true;
+                } else if (readBytes < 0) {
+                    key.cancel();
+                    sc.close();
+                } else {}
+            }
+        }
+    }
+
+    private void doConnect() throws IOException {
+        if (socketChannel.connect(new InetSocketAddress(host,port))) {
+            socketChannel.register(selector, SelectionKey.OP_READ);
+            doWrite(socketChannel);
+        } else {
+            socketChannel.register(selector,SelectionKey.OP_CONNECT);
+        }
+    }
+
+    private void doWrite(SocketChannel sc) throws IOException {
+        byte[] req = "Time".getBytes();
+        ByteBuffer writeBuffer = ByteBuffer.allocate(req.length);
+        writeBuffer.put(req);
+        writeBuffer.flip();
+        sc.write(writeBuffer);
+        if (!writeBuffer.hasRemaining()) {
+            System.out.println("命令发送成功");
+        }
+    }
+
+}
+```
+
+NIO编程的难度大，而且还没有考虑”半包读“和”半包写“，加上会更复杂。
+
+NIO的优点：
+
+（1）客户端发起的连接操作是异步的，可以通过在多路复用器注册OP_CONNECT等待后续结果，不需要像之前的客户端那样被同步阻塞。
+
+（2）SocketChannel的读写操作都是异步的，如果没有可读写的数据它不会同步等待，直接返回，这样I/O通信线程就可以处理其他的链路，不需要同步等待这个链路可用。
+
+（3）线程模型的优化：在linux上的底层是epoll。性能不随客户端的增加先行下降。
+
+因此适合做高性能，高负载的网络服务器。
+
+## 2.4 AIO编程
+
+异步通道通过以下两种方式获取操作结果：
+
+- java.util.concurrent.Future类表示异步操作的结果。
+- 在执行异步操作的时候传入一个java.nio.channels。
+
+CompletionHandle接口的实现类作为操作完成的回调。
+
+不需要多路复用器（Selector），简化NIO的编程模型。
+
