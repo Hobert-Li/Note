@@ -932,3 +932,421 @@ CompletionHandle接口的实现类作为操作完成的回调。
 
 不需要多路复用器（Selector），简化NIO的编程模型。
 
+### 2.4.1 AIO创建的TimeServer源码分析
+
+```java
+package AIO;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/16 9:38
+ */
+
+
+public class TimeServer {
+
+    public static void main(String[] args) {
+        int port = 8080;
+        if (args != null && args.length > 0) {
+            try {
+                port = Integer.valueOf(args[0]);
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+        }
+
+        AsyncTimeServerHandler timeserver = new AsyncTimeServerHandler(port);
+
+        new Thread(timeserver,"AIO-" +
+                "AsyncTimeServerHandler-001").start();
+    }
+
+}
+```
+
+```Java
+package AIO;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.channels.AsynchronousServerSocketChannel;
+import java.util.concurrent.CountDownLatch;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/16 9:41
+ */
+
+
+public class AsyncTimeServerHandler implements Runnable{
+
+    private int port;
+
+    CountDownLatch latch;
+    AsynchronousServerSocketChannel asynchronousServerSocketChannel;
+
+
+    public AsyncTimeServerHandler(int port) {
+        this.port = port;
+        try {
+            asynchronousServerSocketChannel = AsynchronousServerSocketChannel.open();
+            asynchronousServerSocketChannel.bind(new InetSocketAddress(port));
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void run() {
+
+        latch = new CountDownLatch(1);
+        doAccept();
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+
+    }
+
+    private void doAccept() {
+        asynchronousServerSocketChannel.accept(this, new AcceptCompletionHandler());
+    }
+}
+
+```
+
+```Java
+package AIO;
+
+import java.nio.ByteBuffer;
+import java.nio.channels.CompletionHandler;
+import java.nio.channels.AsynchronousSocketChannel;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/16 9:54
+ */
+
+
+public class AcceptCompletionHandler implements CompletionHandler<AsynchronousSocketChannel,AsyncTimeServerHandler> {
+    @Override
+    public void completed(AsynchronousSocketChannel result, AsyncTimeServerHandler attachment) {
+        attachment.asynchronousServerSocketChannel.accept(attachment,this);
+        ByteBuffer buffer = ByteBuffer.allocate(1024);
+        result.read(buffer, buffer, new ReadCompletionHandler(result));
+
+    }
+
+    @Override
+    public void failed(Throwable exc, AsyncTimeServerHandler attachment) {
+        exc.printStackTrace();
+        attachment.latch.countDown();
+    }
+
+}
+
+```
+
+```java
+package AIO;
+
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousSocketChannel;
+import java.nio.channels.CompletionHandler;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/16 10:14
+ */
+
+
+public class ReadCompletionHandler implements CompletionHandler<Integer, ByteBuffer> {
+
+    private AsynchronousSocketChannel channel;
+
+    public ReadCompletionHandler(AsynchronousSocketChannel channel) {
+        if (this.channel == null) {
+            this.channel = channel;
+        }
+    }
+
+    @Override
+    public void completed(Integer result, ByteBuffer attachment) {
+
+        attachment.flip();
+        byte[] body = new byte[attachment.remaining()];
+        attachment.get(body);
+        try {
+            String req = new String(body, "UTF-8");
+            System.out.println("服务器接收到命令：" + req);
+            String currentTime = "time".equalsIgnoreCase(req) ? new java.util.Date(System.currentTimeMillis()).toString() : "命令错误";
+            doWrite(currentTime);
+        } catch (UnsupportedEncodingException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void doWrite(String currentTime) {
+        if (currentTime != null && currentTime.trim().length() > 0) {
+            byte[] bytes = (currentTime).getBytes();
+            ByteBuffer writeBuffer = ByteBuffer.allocate(bytes.length);
+            writeBuffer.put(bytes);
+            writeBuffer.flip();
+            channel.write(writeBuffer, writeBuffer, new CompletionHandler<Integer, ByteBuffer>() {
+                @Override
+                public void completed(Integer result, ByteBuffer buffer) {
+                    if (buffer.hasRemaining())
+                        channel.write(buffer, buffer, this);
+                }
+
+                @Override
+                public void failed(Throwable exc, ByteBuffer buffer) {
+                    try {
+                        channel.close();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                }
+            });
+        }
+    }
+
+    @Override
+    public void failed(Throwable exc, ByteBuffer attachment) {
+        try {
+            this.channel.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+    }
+}
+
+```
+
+### 2.4.2 AIO创建的TimeClient源码分析
+
+```Java
+package AIO;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/16 10:32
+ */
+
+
+public class TimeClient {
+
+    public static void main(String[] args) {
+        int port = 8080;
+        if (args != null && args.length > 0) {
+            try {
+                port = Integer.valueOf(args[0]);
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+        }
+
+        new Thread(new AsyncTimeClientHandler("127.0.0.1",port),"AIO-AsyncTimeClient-001").start();
+    }
+}
+
+```
+
+```Java
+package AIO;
+
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousSocketChannel;
+import java.nio.channels.CompletionHandler;
+import java.util.concurrent.CountDownLatch;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/16 10:35
+ */
+
+
+public class AsyncTimeClientHandler implements CompletionHandler<Void,AsyncTimeClientHandler>,Runnable {
+
+    private AsynchronousSocketChannel client;
+    private String host;
+    private int port;
+    private CountDownLatch latch;
+
+    public AsyncTimeClientHandler(String host, int port) {
+
+        this.host = host;
+        this.port = port;
+        try {
+            client = AsynchronousSocketChannel.open();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+    }
+
+    @Override
+    public void run() {
+
+        latch = new CountDownLatch(1);
+        client.connect(new InetSocketAddress(host, port), this, this);
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        try {
+            client.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+    }
+
+    @Override
+    public void completed(Void result, AsyncTimeClientHandler attachment) {
+
+        byte[] req = "time".getBytes();
+        ByteBuffer writeBuffer = ByteBuffer.allocate(req.length);
+        writeBuffer.put(req);
+        writeBuffer.flip();
+        client.write(writeBuffer, writeBuffer, new CompletionHandler<Integer, ByteBuffer>() {
+            @Override
+            public void completed(Integer result, ByteBuffer buffer) {
+                if (buffer.hasRemaining()) {
+                    client.write(buffer, buffer, this);
+                } else {
+                    ByteBuffer readBuffer = ByteBuffer.allocate(1024);
+                    client.read(readBuffer, readBuffer, new CompletionHandler<Integer, ByteBuffer>() {
+                        @Override
+                        public void completed(Integer result, ByteBuffer buffer) {
+                            buffer.flip();
+                            byte[] bytes = new byte[buffer.remaining()];
+                            buffer.get(bytes);
+                            String body;
+                            try {
+                                body = new String(bytes,"UTF-8");
+                                System.out.println("现在时间：" + body);
+                                latch.countDown();
+                            } catch (UnsupportedEncodingException e) {
+                                e.printStackTrace();
+                            }
+                        }
+
+                        @Override
+                        public void failed(Throwable exc, ByteBuffer buffer) {
+                            try {
+                                client.close();
+                            } catch (IOException e) {
+                                e.printStackTrace();
+                            }
+                        }
+                    });
+                }
+            }
+
+            @Override
+            public void failed(Throwable exc, ByteBuffer buffer) {
+                try {
+                    client.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        });
+
+    }
+
+    @Override
+    public void failed(Throwable exc, AsyncTimeClientHandler attachment) {
+        exc.printStackTrace();
+
+        try {
+            client.close();
+            latch.countDown();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
+
+```
+
+## 2.5 4种I/O的对比
+
+### 2.5.1 概念澄清
+
+1. 异步非阻塞I/O
+
+JDK1.4开始提供的NIO严格按照网络编程模型和JDK实现来分类，实际上只能被称为非阻塞I/O不能叫异步非阻塞I/O。1.5用epoll替换了select/poll，只是底层性能的优化，并没有替换I/O模型。
+
+JDK1.7提供的NIO2.0是真正的异步I/O。
+
+但习惯上NIO相对于IO还是被称为异步非阻塞IO或非阻塞I/O。
+
+2. 多路复用器Selector
+
+3. 伪异步I/O
+
+完全来源于实践，加入一个缓冲区（线程池）。不是官方概念。
+
+### 2.5.2 不同I/O模型的对比
+
+|                     | 同步阻塞I/O（BIO） | 伪异步I/O             | 非阻塞I/O（NIO）                     | 异步I/O（AIO）                            |
+| ------------------- | ------------------ | --------------------- | ------------------------------------ | ----------------------------------------- |
+| 客户端个数：I/O线程 | 1：1               | M:N（其中M可以大于N） | M：1（1个I/O线程除了多个客户端连接） | M：0（不需要启动额外的I/O线程，被动回调） |
+| I/O类型（阻塞）     | 阻塞I/O            | 阻塞I/O               | 非阻塞I/O                            | 非阻塞I/O                                 |
+| I/O类型（同步）     | 同步I/O            | 同步I/O               | 同步I/O（I/O多路复用）               | 异步I/O                                   |
+| API使用难度         | 简单               | 简单                  | 非常复杂                             | 复杂                                      |
+| 可靠性              | 非常差             | 差                    | 高                                   | 高                                        |
+| 吞吐量              | 低                 | 中                    | 高                                   | 高                                        |
+
+## 2.6 选择Netty的理由
+
+### 2.6.1 不选择Java原生NIO的原因
+
+（1）NIO的类库和API繁杂，使用麻烦，需要熟练掌握Selector、ServerSocketChannel、SocketChannel、ByteBuffer等；
+
+（2）涉及到Reactor模式，必须非常熟悉多线程和网络编程；
+
+（3）可靠性补齐的工作量和难度大；
+
+（4）BUG，epoll bug。
+
+### 2.6.2 为什么选择Netty
+
+优点如下：
+
+- API使用简单，开发门槛低。
+- 功能强大，预置了多种编解码功能，支持多种主流协议。
+- 。。。
+
+## 2.7 总结
+
+# 第3章 Netty入门应用
+
