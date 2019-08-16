@@ -1350,3 +1350,282 @@ JDK1.7提供的NIO2.0是真正的异步I/O。
 
 # 第3章 Netty入门应用
 
+### 3.1 Netty开发环境的搭建
+
+注意Netty版本号为 5.0.0.Alpha1。
+
+# 3.2 Netty 服务端开发
+
+NIO开发步骤回顾：
+
+（1）创建ServerSocketChannel，并配置为非阻塞；
+
+（2）绑定监听，配置TCP参数，例如backlog大小；
+
+（3）创建一个独立的I/O线程，用于轮询多路复用器Selector；
+
+（4）创建Selector，将之前的ServerSocketChannel注册在Selector上，监听SelectionKey.ACCEPT；
+
+（5）启动I/O线程，在循环体中执行Selector.select()方法，轮询就绪的Channel；
+
+（6）轮循处于就绪状态的Channel，对其判断，如果是OP_ACCEPT，说明是新的客户端接入，则调用ServerSocketChannel.accept()方法接受新的客户端；
+
+（7）设置新接入的客户端链路SocketChannel为非阻塞模式，配置其他的一些TCP参数；
+
+（8）将SocketChannel注册到Selector，监听OP_READ操作位；
+
+（9）监听到后读取；
+
+（10）如果是OP_WRITE，则继续发送。
+
+```Java
+package Time;
+
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/16 15:05
+ */
+
+
+public class TimeServer {
+
+    public void bind(int port) throws Exception {
+
+        //创建两个线程组的原因：一个用于服务端接受客户端的连接，另一个用于进行SocketChannel的网络读写
+        EventLoopGroup bossGroup = new NioEventLoopGroup();
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+
+        try {
+            //Netty用于启动NIO服务端的辅助启动类，目的是降低服务端的开发复杂度
+            ServerBootstrap b = new ServerBootstrap();
+
+            b.group(bossGroup,workerGroup)//传入线程组
+                    .channel(NioServerSocketChannel.class)//设置Channel，对应NIO中的ServerSocketChannel
+                    .option(ChannelOption.SO_BACKLOG, 1024)//配置TCP参数，设置backlog为1024
+                    .childHandler(new ChildChannelHandler());
+
+            ChannelFuture f = b.bind(port).sync();//绑定并阻塞，完成后取消阻塞，返回一个ChannelFuture，类似于JDK的Future
+            f.channel().closeFuture().sync();//阻塞，等待服务端链路关闭之后才退出main函数
+        } finally {
+            //优雅退出
+            bossGroup.shutdownGracefully();
+            workerGroup.shutdownGracefully();
+        }
+    }
+
+
+    private class ChildChannelHandler extends ChannelInitializer<SocketChannel> {
+
+        @Override
+        protected void initChannel(SocketChannel arg0) throws Exception {
+            arg0.pipeline().addLast(new TimeServerHandle());
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        int port = 8080;
+        if (args != null && args.length > 0) {
+            try {
+                port = Integer.valueOf(args[0]);
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+        }
+
+        new TimeServer().bind(port);
+    }
+}
+
+```
+
+```java
+package Time;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+
+import java.io.UnsupportedEncodingException;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/16 15:28
+ */
+
+
+public class TimeServerHandler extends ChannelHandlerAdapter {
+
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+
+        ByteBuf buf = (ByteBuf) msg;//类似ByteBuffer，更强大灵活
+        byte[] req = new byte[buf.readableBytes()];
+        buf.readBytes(req);
+        String body = new String(req, "UTF-8");
+        String currentTime = "time".equalsIgnoreCase(body) ? new java.util.Date(System.currentTimeMillis()).toString() : "命令错误";
+        ByteBuf resp = Unpooled.copiedBuffer(currentTime.getBytes());
+        ctx.write(resp);
+    }
+
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        ctx.flush();//从性能角度考虑，为避免频繁唤醒Selector进行消息发送，Netty不直接写，而是先放到缓冲数组，再调用flush写入。
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        ctx.close();//发生异常时释放。
+    }
+
+}
+
+```
+
+## 3.3 Netty客户端开发
+
+```java
+package Time;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/16 15:47
+ */
+
+
+public class TimeClient {
+
+    public void connect(int port, String host) throws Exception {
+
+        EventLoopGroup group = new NioEventLoopGroup();
+
+        try {
+            Bootstrap b = new Bootstrap();
+            b.group(group)
+                    .channel(NioSocketChannel.class)
+                    .option(ChannelOption.TCP_NODELAY,true)
+                    .handler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) throws Exception {
+                            ch.pipeline().addLast(new TimeClientHandler());//将ClientHandler设置到ChannelPipeline中，用于处理网络I/O事件
+                        }
+                    });
+
+            ChannelFuture f = b.connect(host, port).sync();//connect异步连接，sync同步等待连接
+
+            f.channel().closeFuture().sync();
+        } finally {
+            group.shutdownGracefully();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+
+        int port = 8080;
+        if (args != null && args.length > 0) {
+            try {
+                port = Integer.valueOf(args[0]);
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+        }
+
+        new TimeClient().connect(port, "127.0.0.1");
+    }
+}
+```
+
+```java
+package Time;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandler;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.util.concurrent.EventExecutorGroup;
+
+import java.io.UnsupportedEncodingException;
+import java.util.logging.Logger;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/16 15:59
+ */
+
+
+public class TimeClientHandler extends ChannelHandlerAdapter {
+
+    private static final Logger logger = Logger.getLogger(TimeClientHandler.class.getName());
+
+    private final ByteBuf firstMessage;
+
+    public TimeClientHandler() {
+        byte[] req = "time".getBytes();
+        firstMessage = Unpooled.buffer(req.length);
+        firstMessage.writeBytes(req);
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) {
+        ctx.writeAndFlush(firstMessage);
+    }
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        ByteBuf buf = (ByteBuf) msg;
+        byte[] req = new byte[buf.readableBytes()];
+        buf.readBytes(req);
+        String body = new String(req, "UTF-8");
+        System.out.println("现在时间：" + body);
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        logger.warning("出错：" + cause.getMessage());
+        ctx.close();
+    }
+
+}
+```
+
+## 3.4 运行和调试
+
+略
+
+## 3.5 总结
+
+# 第4章 TCP粘包/拆包问题的解决之道
+
+## 4.1 TCP粘包/拆包
+
+TCP不了解上层业务数据的具体含义，它会根据TCP缓冲区的实际情况进行包的划分。
+
