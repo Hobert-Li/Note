@@ -1629,3 +1629,846 @@ public class TimeClientHandler extends ChannelHandlerAdapter {
 
 TCP不了解上层业务数据的具体含义，它会根据TCP缓冲区的实际情况进行包的划分。
 
+### 4.1.1 TCP粘包/拆包问题说明
+
+4种情况（假设客户端发包）：
+
+（1）服务端收到两个独立数据包，无粘包/拆包；
+
+（2）服务端收到两个粘合在一起的包，粘包；
+
+（3）服务端分两次读取到一个包，拆包；
+
+（4）同3；
+
+（5）接收窗口过小，出现多次拆包；
+
+### 4.1.2 TCP粘包/拆包发生的原因
+
+3个原因：
+
+（1）应用程序write写入的字节大小大于套接口发送大小；
+
+（2）进行MSS（最大报文长度）大小的TCP分段；
+
+（3）以太网帧的payload大于MTU进行IP分片；
+
+### 4.1.3 粘包问题的解决策略
+
+由于底层的TCP不能理解业务数据，只能通过上层的应用协议栈设计来解决，4个策略：
+
+（1）消息定长（例如固定每个报文段的大小为固定长度，不够则补空格）；
+
+（2）在包尾增加回车换行符进行分割，例如FTP协议；
+
+（3）消息头消息体，消息头中设立一个总长度字段；
+
+（4）更复杂的应用层协议。
+
+## 4.2 未考虑TCP粘包导致功能异常案例
+
+### 4.2.1 TimeServer的改造
+
+```java
+package _4_;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/16 15:28
+ */
+
+
+public class TimeServerHandler extends ChannelHandlerAdapter {
+
+    private int counter;
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+
+        ByteBuf buf = (ByteBuf) msg;//类似ByteBuffer，更强大灵活
+        byte[] req = new byte[buf.readableBytes()];
+        buf.readBytes(req);
+        String body = new String(req, "UTF-8").substring(0, req.length - System.getProperty("line.separator").length());
+        System.out.println("服务端接收到命令：" + body + "; 计数：" + ++counter);
+        String currentTime = "time".equalsIgnoreCase(body) ? new java.util.Date(System.currentTimeMillis()).toString() : "命令错误";
+        ByteBuf resp = Unpooled.copiedBuffer(currentTime.getBytes());
+        ctx.writeAndFlush(resp);
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        ctx.close();//发生异常时释放。
+    }
+
+}
+```
+
+### 4.2.2 TimeClient的改造
+```java
+package _4_;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+
+import java.util.logging.Logger;
+
+
+/**
+ *
+ */
+public class TimeClientHandler extends ChannelHandlerAdapter {
+
+    private static final Logger logger = Logger.getLogger(TimeClientHandler.class.getName());
+
+    private int counter;
+
+    private byte[] req;
+
+    public TimeClientHandler() {
+        req = ("time" + System.getProperty("line.separator")).getBytes();
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) throws Exception {
+        ByteBuf message = null;
+        for (int i = 0; i < 100; i++) {//建立连接后循环发送100条消息，保证每条都被写入到Channel
+            message = Unpooled.buffer(req.length);
+            message.writeBytes(req);
+            ctx.writeAndFlush(message);
+        }
+    }
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        ByteBuf buf = (ByteBuf) msg;
+        byte[] req = new byte[buf.readableBytes()];
+        buf.readBytes(req);
+        String body = new String(req, "UTF-8");
+        System.out.println("现在时间：" + body + "; 计数：" + ++counter);
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        logger.warning("出错：" + cause.getMessage());
+        ctx.close();
+    }
+}
+```
+
+### 4.2.3 运行结果
+
+出现TCP粘包
+
+## 4.3 利用LineBasedFrameDecoder解决TCP粘包问题
+
+代码不贴了，就是将自己在ByteBuf中的操作省去，然后加入两个解码器LineBasedFrameDecoder和StringDecoder。
+
+### 4.3.3 运行TCP粘包的时间服务器程序
+
+运行成功，符合预期。成功解决了TCP粘包导致的读半包问题。
+
+### 4.3.4 LineBasedFrameDecoder和StringDecoder的原理分析
+
+LineBasedFrameDecoder的工作原理：依次遍历，有“\n”或者“\r\n”则结束。以换行符为结束标志的解码器，支持携带结束符或者不携带结束符两种解码方式，同时支持配置单行的最大长度。如果连续读取到最大长度后仍然没有发现换行符，就会抛出异常，同时忽略掉之前督导的异常码流。
+
+StringDecoder的功能非常简单，就是将接收到的对象转换成字符串，然后继续调用后面的Handler。
+
+LineBasedFrameDecoder+StringDecoder组合就是按行切换的文本解码器，被设计用来支持TCP的粘包和拆包。
+
+## 4.4 总结
+
+# 第5章 分隔符和定长解码器的应用
+
+区分消息的四种方式：
+
+（1）消息定长
+
+（2）回车换行符作为消息结束符
+
+（3）特殊符号作为结束标志，回车为一种特殊实现
+
+（4）通常在消息头中定义长度字段来标识消息的总长度
+
+## 5.1 DelimiterBasedFrameDecoder应用开发
+
+以分隔符作为码流结束标识的消息的解码。以“$_”作为分隔符。
+
+### 5.1.3 DelimiterBasedFrameDecoder服务端开发
+
+```java
+package _5_1_;
+
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.DelimiterBasedFrameDecoder;
+import io.netty.handler.codec.string.StringDecoder;
+import io.netty.handler.logging.LogLevel;
+import io.netty.handler.logging.LoggingHandler;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/19 11:03
+ */
+
+
+public class EchoServer {
+    public void bind(int port) throws Exception {
+
+        EventLoopGroup bossGroup = new NioEventLoopGroup();
+        EventLoopGroup workGroup = new NioEventLoopGroup();
+
+        try {
+            ServerBootstrap b = new ServerBootstrap();
+            b.group(bossGroup,workGroup)
+                    .channel(NioServerSocketChannel.class)
+                    .handler(new LoggingHandler(LogLevel.INFO))
+                    .childHandler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) throws Exception {
+                            ByteBuf delimiter = Unpooled.copiedBuffer("$_".getBytes());//创建分隔符缓冲对象，以$_为分隔符。
+                            ch.pipeline().addLast(new DelimiterBasedFrameDecoder(1024,delimiter));//设置单条消息最大长度，加入分隔符对象
+                            ch.pipeline().addLast(new StringDecoder());
+                            ch.pipeline().addLast(new EchoServerHandler());
+                        }
+                    });
+
+            ChannelFuture f = b.bind(port).sync();
+
+            f.channel().closeFuture().sync();
+        } finally {
+            bossGroup.shutdownGracefully();
+            workGroup.shutdownGracefully();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        int port = 8080;
+        if (args != null && args.length > 0) {
+            try {
+                port = Integer.valueOf(args[0]);
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+        }
+
+        new EchoServer().bind(port);
+    }
+}
+
+```
+
+```java
+package _5_1_;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandler;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelHandlerInvoker;
+import io.netty.util.concurrent.EventExecutorGroup;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/19 11:12
+ */
+
+
+public class EchoServerHandler extends ChannelHandlerAdapter {
+
+    int counter = 0;
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+
+        String body = (String) msg;
+        System.out.println("第" + ++counter +"次接收来自客户端的消息：["+body+"]");//打印接收到的消息
+        body += "$_";
+        ByteBuf echo = Unpooled.copiedBuffer(body.getBytes());
+        ctx.writeAndFlush(echo);
+
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        cause.printStackTrace();
+        ctx.close();
+    }
+}
+
+```
+
+### 5.1.2 DelimiterBasedFrameDecoder客户端开发
+
+```java
+package _5_1_;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.DelimiterBasedFrameDecoder;
+import io.netty.handler.codec.string.StringDecoder;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/19 11:18
+ */
+
+
+public class EchoClient {
+
+    public void connect(int port, String host) throws Exception {
+
+        EventLoopGroup group = new NioEventLoopGroup();
+
+        try {
+            Bootstrap b = new Bootstrap();
+            b.group(group)
+                    .channel(NioSocketChannel.class)
+                    .option(ChannelOption.TCP_NODELAY,true)
+                    .handler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) throws Exception {
+                            ByteBuf delimiter = Unpooled.copiedBuffer("$_".getBytes());
+                            ch.pipeline().addLast(new DelimiterBasedFrameDecoder(1024,delimiter));
+                            ch.pipeline().addLast(new StringDecoder());
+                            ch.pipeline().addLast(new EchoClientHandler());
+                        }
+                    });
+
+            ChannelFuture f = b.connect(host, port).sync();
+
+            f.channel().closeFuture().sync();
+        } finally {
+            group.shutdownGracefully();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        int port = 8080;
+        if (args != null && args.length > 0) {
+            try {
+                port = Integer.valueOf(args[0]);
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+        }
+
+        new EchoClient().connect(port, "127.0.0.1");
+    }
+}
+
+```
+
+```java
+package _5_1_;
+
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/19 11:27
+ */
+
+
+public class EchoClientHandler extends ChannelHandlerAdapter {
+
+    private int counter;
+
+    static final String ECHO_REQ = "hello,world.$_";
+
+    public EchoClientHandler() {
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) throws Exception {
+        for (int i = 0; i < 10; i++) {
+            ctx.writeAndFlush(Unpooled.copiedBuffer(ECHO_REQ.getBytes()));
+        }
+    }
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        System.out.println("第" + ++counter +"次接收来自服务端的返回：["+msg+"]");
+    }
+
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        ctx.flush();
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        cause.printStackTrace();
+        ctx.close();
+    }
+
+}
+
+```
+
+## 5.2 FixedLengthFrameDecoder应用开发
+
+FixedLengthFrameDecoder固定长度解码器。
+
+### 5.2.1 FixedLengthFrameDecoder服务端开发
+
+利用FixedLengthFrameDecoder解码器，无论一次接收到多少数据报，它都会按照构造函数中设置的固定长度进行解码，如果是半包消息，FixedLengthFrameDecoder会缓存半包消息并等待下个包到达后进行拼包，知道读取到一个完整的包。
+
+```java
+package _5_2_;
+
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.DelimiterBasedFrameDecoder;
+import io.netty.handler.codec.FixedLengthFrameDecoder;
+import io.netty.handler.codec.string.StringDecoder;
+import io.netty.handler.logging.LogLevel;
+import io.netty.handler.logging.LoggingHandler;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/19 11:03
+ */
+
+
+public class EchoServer {
+    public void bind(int port) throws Exception {
+
+        EventLoopGroup bossGroup = new NioEventLoopGroup();
+        EventLoopGroup workGroup = new NioEventLoopGroup();
+
+        try {
+            ServerBootstrap b = new ServerBootstrap();
+            b.group(bossGroup,workGroup)
+                    .channel(NioServerSocketChannel.class)
+                    .option(ChannelOption.SO_BACKLOG, 100)//加入一个属性
+                    .handler(new LoggingHandler(LogLevel.INFO))
+                    .childHandler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) throws Exception {
+                            ch.pipeline().addLast(new FixedLengthFrameDecoder(20));//设置单条消息最大长度，加入分隔符对象
+                            ch.pipeline().addLast(new StringDecoder());
+                            ch.pipeline().addLast(new EchoServerHandler());
+                        }
+                    });
+
+            ChannelFuture f = b.bind(port).sync();
+
+            f.channel().closeFuture().sync();
+        } finally {
+            bossGroup.shutdownGracefully();
+            workGroup.shutdownGracefully();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        int port = 8080;
+        if (args != null && args.length > 0) {
+            try {
+                port = Integer.valueOf(args[0]);
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+        }
+
+        new EchoServer().bind(port);
+    }
+}
+
+```
+
+```java
+package _5_2_;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/19 11:12
+ */
+
+
+public class EchoServerHandler extends ChannelHandlerAdapter {
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+
+        System.out.println("接收到来自客户端的消息："+"["+msg+"]");
+
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        cause.printStackTrace();
+        ctx.close();
+    }
+}
+
+```
+
+
+
+### 5.2.2 利用telnet命令行测试EchoServer服务端
+
+telnet命令相关操作此处不赘述。
+
+以20字节长度进行截取。
+
+## 5.3 总结
+
+- DelimiterBasedFrameDecoder用于对使用分隔符结尾的消息进行自动解码。
+- FixLengthFrameDecoder用于对固定长度的消息进行自动解码。
+
+# 第6章 编解码技术
+
+Java序列化的目的：
+
+- 网络传输
+- 对象持久化
+
+Java对象编解码技术：在进行远程跨进程服务调用时，需要把被传输的Java对象编码为字节数组或者ByteBuffer对象。而当远程服务读取到ByteBuffer对象或者字节数组时，需要将其解码为发送时的Java对象。
+
+Java序列化仅仅是Java编解码技术的一种，有缺陷。
+
+## 6.1 Java序列化的缺点
+
+RPC很少使用Java序列化进行消息的编解码和传输。原因如下：
+
+### 6.1.1 无法跨语言
+
+Java序列化技术时Java语言内部的私有协议，其他语言并不支持，对于用户来说完全是黑盒。对于Java序列化后的字节数组，别的语言无法进行反序列化。
+
+### 6.1.2 序列化后的码流太大
+
+序列化测试：
+
+```java
+package _6_1_2_;
+
+import java.io.Serializable;
+import java.nio.ByteBuffer;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/19 12:52
+ */
+
+
+public class UserInfo implements Serializable {
+
+    private static final long serialVersionID = 1L;
+
+    private String userName;
+    private int userID;
+
+    public UserInfo(String userName, int userID) {
+        this.userName = userName;
+        this.userID = userID;
+    }
+
+    public String getUserName() {
+        return userName;
+    }
+
+    public void setUserName(String userName) {
+        this.userName = userName;
+    }
+
+    public int getUserID() {
+        return userID;
+    }
+
+    public void setUserID(int userID) {
+        this.userID = userID;
+    }
+
+    public byte[] codeC() {
+        ByteBuffer buffer = ByteBuffer.allocate(1024);
+        byte[] value = this.userName.getBytes();
+        buffer.putInt(value.length);
+        buffer.put(value);
+        buffer.putInt(this.userID);
+        buffer.flip();
+
+        value = null;
+        byte[] result = new byte[buffer.remaining()];
+        buffer.get(result);
+        return result;
+    }
+}
+
+```
+
+```java
+package _6_1_2_;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/19 12:59
+ */
+
+
+public class TestUserInfo {
+    public static void main(String[] args) throws IOException {
+        UserInfo info = new UserInfo("Welcome to Netty", 100);
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        ObjectOutputStream os = new ObjectOutputStream(bos);
+        os.writeObject(info);
+        os.flush();
+        os.close();
+        byte[] b = bos.toByteArray();
+        System.out.println("JDK序列化长度：" + b.length);
+        bos.close();
+        System.out.println("-------------------------");
+        System.out.println("byte数组序列化长度：" + info.codeC().length);
+    }
+}
+
+```
+
+测试结果：JDK序列化机制编码后的二进制数组大小是二进制编码的5倍多。
+
+评判编解码框架的优劣时，考虑如下因素：
+
+- 是否支持跨语言，支持的语言种类是否丰富；
+- 编码后的码流大小；
+- 编解码的性能；
+- 类库是否小巧，API使用是否方便；
+- 使用者需要手工开发的工作量和难度。
+
+编码后的字节数组大，存储时占用空间大，硬件成本大，网络传输时更占用带宽，导致系统的吞吐量降低。
+
+### 6.1.3 序列化性能太低
+
+性能测试：
+
+```java
+package _6_1_3_;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
+import java.nio.ByteBuffer;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/19 13:43
+ */
+
+
+public class PerformTestUserInfo {
+
+    public static void main(String[] args) throws IOException {
+        UserInfo info = new UserInfo("Welcome to Netty", 100);
+        int loop = 1000000;
+
+        ByteArrayOutputStream bos = null;
+        ObjectOutputStream os = null;
+
+        long startTime = System.currentTimeMillis();
+        for (int i = 0; i < loop; i++) {
+            bos = new ByteArrayOutputStream();
+            os = new ObjectOutputStream(bos);
+            os.flush();
+            os.close();
+            byte[] b = bos.toByteArray();
+            bos.close();
+        }
+
+        long endTime = System.currentTimeMillis();
+        System.out.println("JDK序列化用时："+(endTime - startTime)+" ms");
+
+        System.out.println("=========================================");
+        ByteBuffer buffer = ByteBuffer.allocate(1024);
+        startTime = System.currentTimeMillis();
+        for (int i = 0; i < loop; i++) {
+            byte[] b = info.codeC(buffer);
+        }
+        endTime = System.currentTimeMillis();
+        System.out.println("byte数组序列化用时："+(endTime - startTime)+" ms");
+    }
+}
+
+```
+
+Java序列化性能只有二进制编码的6%左右，性能很低。
+
+## 6.2 业界主流的编解码框架
+
+略
+
+## 6.3 总结
+
+# 第7章 MessagePack编解码
+
+MessagePack是一个高效的二进制序列化框架。像JSON一样支持不同语言间的数据交换，但是性能更快，序列化之后的码流也更小。
+
+## 7.1 MessagePack介绍
+
+特点如下：
+
+- 编解码高效，性能高；
+- 序列化之后的码流小；
+- 支持跨语言。
+
+### 7.1.1 MessagePack多语言支持
+
+几乎都支持，不例举。
+
+### 7.1.2 MessagePack Java API介绍
+
+略
+
+## 7.2 MessagePack编码器和解码器开发
+
+Netty的编解码框架可以非常方便的继承第三方序列化框架。
+
+### 7.2.1 MessagePack编码器开发
+
+```java
+package _7_2_1_;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.MessageToByteEncoder;
+import org.msgpack.MessagePack;
+
+import java.util.List;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/19 14:05
+ */
+
+
+public class MsgpackEncoder extends MessageToByteEncoder<Object> {
+    @Override
+    protected void encode(ChannelHandlerContext atg0, Object arg1, ByteBuf arg2) throws Exception {
+        MessagePack msgpack = new MessagePack();
+        byte[] raw = msgpack.write(arg1);
+        arg2.writeBytes(raw);
+    }
+}
+
+```
+
+MsgpackEncoder继承MessageToByteEncoder，负责将Object类型的POJO对象编码为byte数组，然后写入到ByteBuf中。
+
+### 7.2.2 MessagePack解码器开发
+
+```java
+package _7_2_1_;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.MessageToMessageDecoder;
+import org.msgpack.MessagePack;
+
+import java.util.List;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/19 14:39
+ */
+
+
+public class MsgpackDecoder extends MessageToMessageDecoder<ByteBuf> {
+
+    @Override
+    protected void decode(ChannelHandlerContext arg0, ByteBuf arg1, List<Object> arg2) throws Exception {
+        final byte[] array;
+        final int length = arg1.readableBytes();
+        array = new byte[length];
+        arg1.getBytes(arg1.readerIndex(), array, 0, length);
+        MessagePack msgpack = new MessagePack();
+        arg2.add(msgpack.read(array));//解码
+    }
+}
+
+```
+
+### 7.2.3 功能测试
+
+暂未通过；
+
+# 第8章 Google Protobuf编解码
+
+略
+
+# 第9章 JBoss Marshalling编解码
+
