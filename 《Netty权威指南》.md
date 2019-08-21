@@ -2472,3 +2472,495 @@ public class MsgpackDecoder extends MessageToMessageDecoder<ByteBuf> {
 
 # 第9章 JBoss Marshalling编解码
 
+# 第10章 HTTP协议开发应用
+
+HTTP是一个属于应用层的面向对象的协议。Netty的HTTP协议也是异步非阻塞的。
+
+## 10.1 HTTP协议介绍
+
+主要特点：
+
+- 支持C/S模式；
+- 简单——客户端向服务端请求服务，秩序指定服务URL，携带必要的请求参数或消息体；
+- 灵活——HTTP允许传输任意类型的数据对象，传输的内容类型由HTTP消息头中的Content-Type加以标记；
+- 无状态——对事务处理没有记忆能力。
+
+### 10.1.1 HTTP协议的URL
+
+```url
+http://host[":"port][abs_path]
+```
+
+详细介绍不赘述。
+
+### 10.1.2 HTTP请求消息（HttpRequest）
+
+三部分：
+
+- HTTP请求行；
+- HTTP消息头；
+- HTTP请求正文。
+
+GET和POST的区别：
+
+（1）根据HTTP规范，GET用于信息获取，应该是安全的和幂等的；POST则表示可能改变服务器上的资源的请求。
+
+（2）GET提交，请求的数据会附在URL之后，就是把数据放置在请求行中，以“?”分隔URL和传输数据，多个参数用“&”连接；而POST提交会把提交的数据放置再HTTP消息的包体中，数据不会在地址栏中显示出来。
+
+（3）传输数据的大小不同，GET受具体浏览器长度的限制。POST理论上长度不受限制。
+
+（4）安全性。
+
+### 10.1.3 HTTP响应消息（HttpResponse）
+
+三部分：
+
+- 状态行；
+- 消息报头；
+- 响应正文。
+
+## 10.2 Netty HTTP服务端入门开发
+
+相比于传统的Tomcat、Jetty等Web容器，它更加轻量和小巧，灵活性和定制性也更好。
+
+### 10.2.1 HTTP服务端例程场景描述
+
+例程场景如下：文件服务器使用HTTP协议对外提供服务，当客户端通过浏览器访问文件服务器时，对访问路径进行检查，检查失败时返回HTTP403错误，该页无法访问；如果校验通过，以连接的方式打开当前文件目录，每个目录或者文件都是个超链接，可以递归访问。
+
+如果是目录，可以继续递归访问它下面的子目录或者文件，如果时文件且可读，则可以在浏览器端直接打开，或者通过【目标另存为】下载该文件。
+
+### 10.2.2 HTTP服务端开发
+
+```java
+package HTTP;
+
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.codec.http.HttpRequestDecoder;
+import io.netty.handler.codec.http.HttpResponseEncoder;
+import io.netty.handler.stream.ChunkedWriteHandler;
+
+import java.net.InetAddress;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/21 10:44
+ */
+
+
+public class HttpFileServer {
+
+    private static final String DEFAULT_URL = "/src";
+
+    public void run(final int port, final String url) throws Exception {
+
+        EventLoopGroup bossGroup = new NioEventLoopGroup();
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+
+        try {
+            ServerBootstrap b = new ServerBootstrap();
+            b.group(bossGroup, workerGroup)
+                    .channel(NioServerSocketChannel.class)
+                    .childHandler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) throws Exception {
+                            ch.pipeline().addLast("http-decoder", new HttpRequestDecoder());//向ChannelPipeLine中添加HTTP请求消息解码器
+                            ch.pipeline().addLast("http-aggregator", new HttpObjectAggregator(65536));//添加HttpObjectAggregator解码器
+                            ch.pipeline().addLast("http-encoder", new HttpResponseEncoder());//HTTP响应编码器
+                            ch.pipeline().addLast("http-chunked", new ChunkedWriteHandler());//支持异步发送大的码流（例如大文件传输，但不占用过多内存，防止Java内存溢出错误）
+                            ch.pipeline().addLast("fileServerHandler", new HttpFileServerHandler(url));//
+                        }
+                    });
+
+            ChannelFuture f = b.bind(InetAddress.getLocalHost().getHostAddress(), port).sync();
+            System.out.println("Http文件目录服务器启动，网址是：" + InetAddress.getLocalHost().getHostAddress() +":" + port + url);
+            f.channel().closeFuture().sync();
+        } finally {
+            bossGroup.shutdownGracefully();
+            workerGroup.shutdownGracefully();
+        }
+    }
+
+    public static void main(String[] args) throws Exception{
+        int port = 8080;
+        if (args != null && args.length > 0) {
+            try {
+                port = Integer.valueOf(args[0]);
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+        }
+
+        String url = DEFAULT_URL;
+        if (args.length > 1)
+            url = args[1];
+
+        new HttpFileServer().run(port, url);
+    }
+
+}
+
+```
+
+```java
+package HTTP;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.*;
+import io.netty.handler.codec.http.*;
+import io.netty.handler.stream.ChunkedFile;
+
+import javax.activation.MimetypesFileTypeMap;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.RandomAccessFile;
+import java.io.UnsupportedEncodingException;
+import java.net.URLDecoder;
+import java.util.regex.Pattern;
+
+import static io.netty.handler.codec.http.HttpHeaders.Names.*;
+import static io.netty.handler.codec.http.HttpHeaders.isKeepAlive;
+import static io.netty.handler.codec.http.HttpHeaders.setContentLength;
+import static io.netty.handler.codec.http.HttpMethod.GET;
+import static io.netty.handler.codec.http.HttpResponseStatus.*;
+import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
+import static io.netty.util.CharsetUtil.UTF_8;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/21 11:02
+ */
+
+
+public class HttpFileServerHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
+    private final String url;
+
+    public HttpFileServerHandler(String url) {
+        this.url = url;
+    }
+
+    @Override
+    protected void messageReceived(ChannelHandlerContext ctx, FullHttpRequest request) throws Exception {
+        //对Http请求消息的解码结果进行判断，如果解码失败，直接构造HTTP400错误返回。
+        if (!request.getDecoderResult().isSuccess()) {
+            sendError(ctx, BAD_REQUEST);
+            return;
+        }
+
+        //对请求行中的方法进行判断，如果不是从浏览器或者表单设置为GET发起的请求（例如POST），则构造HTTP405错误返回。
+        if (request.getMethod() != GET) {
+            sendError(ctx, METHOD_NOT_ALLOWED);
+            return;
+        }
+
+        final String uri = request.getUri();
+        //对URL进行包装
+        final String path = sanitizeUri(uri);
+
+        //如果构造的URI不合法，则返回403错误
+        if (path == null) {
+            sendError(ctx, FORBIDDEN);
+            return;
+        }
+
+        //使用新组装的URI路径构造File对象。
+        File file = new File(path);
+
+        //如果文件不存在或是系统隐藏文件，则构造Http404异常返回
+        if (file.isHidden() || !file.exists()) {
+            sendError(ctx, NOT_FOUND);
+            return;
+        }
+
+        //如果文件是目录，则发送目录的链接给客户端连接
+        if (file.isDirectory()) {
+            if (uri.endsWith("/")) {
+                sendListing(ctx, file);
+            } else {
+                sendRedirect(ctx, uri + "/");
+            }
+            return;
+        }
+
+        //点击或下载文件，校验文件合法性。
+        if (!file.isFile()) {
+            sendError(ctx, FORBIDDEN);
+            return;
+        }
+
+        //使用随机文件读写类以制度的方式打开文件，如果文件打开失败，则返回404错误。
+        RandomAccessFile randomAccessFile = null;
+        try {
+            randomAccessFile = new RandomAccessFile(file, "r");//以只读方式打开文件
+        } catch (FileNotFoundException fnfe) {
+            sendError(ctx, NOT_FOUND);
+            return;
+        }
+
+        //获取文件的长度，构造成功的Http应答信息
+        long fileLength = randomAccessFile.length();
+        HttpResponse response = new DefaultFullHttpResponse(HTTP_1_1, OK);
+
+        setContentLength(response, fileLength);
+        setContentTypeHeader(response, file);
+
+        //判断连接是否KeepAlive，如果是，则设置
+        if (isKeepAlive(request)) {
+            response.headers().set(CONNECTION, HttpHeaders.Values.KEEP_ALIVE);
+        }
+
+        ctx.write(response);
+        ChannelFuture sendFileFuture;
+
+        //通过Netty的ChunkedFile对象直接将文件写入到发送缓冲区。
+        sendFileFuture = ctx.write(new ChunkedFile(randomAccessFile, 0, fileLength, 8192),
+                ctx.newProgressivePromise());
+        sendFileFuture.addListener(new ChannelProgressiveFutureListener() {
+            @Override
+            public void operationProgressed(ChannelProgressiveFuture future, long progress, long total) throws Exception {
+                if (total < 0)
+                    System.err.println("传输出错：" + progress);
+                else
+                    System.err.println("传输进度：" + progress+"/"+total);
+            }
+
+            @Override
+            public void operationComplete(ChannelProgressiveFuture future) throws Exception {
+                System.out.println("传输完成。");
+            }
+        });
+
+        //使用chunked编码，最后需要发送一个编码结束的空消息体，将LastHttpContent.EMPTY_LAST_CONTENT发送到缓冲区，标识所有消息体都发送完成。
+        ChannelFuture lastContentFuture = ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
+        if (!isKeepAlive(request)) {
+            lastContentFuture.addListener(ChannelFutureListener.CLOSE);
+        }
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        cause.printStackTrace();
+        if (ctx.channel().isActive()) {
+            sendError(ctx, INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    private  static final Pattern INSECURE_URI = Pattern.compile(".*[<>&\"].*");
+    private String sanitizeUri(String uri) {
+        try {
+            //使用java.net.URLDecoder对URL进行解码，使用UTF-8字符集。
+            uri = URLDecoder.decode(uri, "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            try {
+                uri = URLDecoder.decode(uri, "ISO-8859-1");
+            } catch (UnsupportedEncodingException ex) {
+                throw new Error();
+            }
+        }
+
+        //对URI进行合法性判断，如果URI与允许访问的URI一致或者是其子目录（文件），则校验通过，否则返回空。
+        if (!uri.startsWith(url))
+            return null;
+        if (!uri.startsWith("/"))
+            return null;
+
+        //将硬编码的文件路径替换为本地操作系统的文件路径分隔符。
+        uri = uri.replace('/', File.separatorChar);
+        //对新的URI进行二次合法性校验。
+        if(uri.contains(File.separator + '.') || uri.contains('.' + File.separator) ||
+                uri.startsWith(".") || uri.endsWith(".") || INSECURE_URI.matcher(uri).matches()){
+            return null;
+        }
+
+        //校验完成，使用当前运行程序所在的工作目录+URI构造绝对路径返回。
+        return System.getProperty("user.dir") + File.separator + uri;
+    }
+
+    private static final Pattern ALLOWED_FILE_NAME = Pattern.compile("[A-Za-z0-9][-_A-Za-z0-9\\.]*");
+    private void sendListing(ChannelHandlerContext ctx, File dir) {
+
+        //创建成功的Http响应消息，并设置消息头
+        FullHttpResponse response = new DefaultFullHttpResponse(HTTP_1_1, OK);
+        response.headers().set(CONTENT_TYPE, "text/html;charset=UTF-8");
+
+        //消息体
+        String dirPath = dir.getPath();
+        StringBuilder buf = new StringBuilder();
+
+        buf.append("<!DOCTYPE html>\r\n");
+        buf.append("<html><head><title>");
+        buf.append(dirPath);
+        buf.append("目录:");
+        buf.append("</title></head><body>\r\n");
+
+        buf.append("<h3>");
+        buf.append(dirPath).append(" 目录：");
+        buf.append("</h3>\r\n");
+        buf.append("<ul>");
+        buf.append("<li>链接：<a href=\" ../\">..</a></li>\r\n");
+
+        //展示所有文件和文件夹，同时使用超链接来标识
+        for (File f : dir.listFiles()) {
+            if(f.isHidden() || !f.canRead()) {
+                continue;
+            }
+            String name = f.getName();
+            if (!ALLOWED_FILE_NAME.matcher(name).matches()) {
+                continue;
+            }
+
+            buf.append("<li>链接：<a href=\"");
+            buf.append(name);
+            buf.append("\">");
+            buf.append(name);
+            buf.append("</a></li>\r\n");
+        }
+
+        buf.append("</ul></body></html>\r\n");
+
+        //分配对应消息的缓冲对象。
+        ByteBuf buffer = Unpooled.copiedBuffer(buf, UTF_8);
+
+        //将缓冲区中的响应消息存放到Http应答消息中，然后释放缓冲区
+        response.content().writeBytes(buffer);
+        buffer.release();
+        ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+    }
+
+    private void sendRedirect(ChannelHandlerContext ctx, String newUri) {
+        FullHttpResponse response = new DefaultFullHttpResponse(HTTP_1_1, FOUND);
+        response.headers().set(LOCATION,newUri);
+        ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+    }
+
+    private void sendError(ChannelHandlerContext ctx, HttpResponseStatus status) {
+        FullHttpResponse response = new DefaultFullHttpResponse(HTTP_1_1, status,
+                Unpooled.copiedBuffer("Failure: " + status.toString() + "\r\n", UTF_8));
+        response.headers().set(CONTENT_TYPE, "text/html;charset=UTF-8");
+        ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+    }
+
+    private void setContentTypeHeader(HttpResponse response, File file) {
+        MimetypesFileTypeMap mimetypesFileTypeMap = new MimetypesFileTypeMap();
+        response.headers().set(CONTENT_TYPE, mimetypesFileTypeMap.getContentType(file.getPath()));
+    }
+}
+
+```
+
+## 10.3  Netty HTTP+XML协议栈开发
+
+由于HTTP协议的通用性，很多异构系统间的通信交互采用HTTP协议，通过HTTP协议承载业务数据进行消息交互。例如非常流行的HTTP+XML或者Restful+JSON。
+
+很多基于HTTP的应用都是后台应用，HTTP仅仅是承载数据交换的一个通道，是一个载体而不是Web容器。所以在这种场景下，一般不需要Tomcat这样的重量行Web容器。
+
+且Tomcat会有很多安全漏洞。所以一个轻量级的HTTP协议栈是个更好的选择。
+
+### 10.3.1 开发场景介绍
+
+模拟一个简单的用户订购系统。客户端填写订单，通过HTTP客户端向服务端发送订购请求，请求消息放在HTTP消息体中，以XML承载，即采用HTTP+XML的方式进行通信。
+
+双方采用HTTP1.1协议，连接类型为CLOSE方式，即双方交互完成，由HTTP服务端主动关闭链路，随后客户端也关闭链路并退出。
+
+订购请求消息定义如表所示：
+
+| 字段名称 | 类型      | 备注                                                         |
+| -------- | --------- | ------------------------------------------------------------ |
+| 订购数量 | Int64     | 订购的商品数量                                               |
+| 客户信息 | Customer  | 客户信息，负责POJO对象                                       |
+| 账单地址 | Address   | 账单的地址                                                   |
+| 寄送方式 | Shippling | 枚举类型如下：<br>普通快递<br>宅急送<br>国际配送<br>国内快递<br>国际快递 |
+| 送货地址 | Address   |                                                              |
+| 总价     | float     |                                                              |
+
+ 客户信息定义：
+
+| 字段名称 | 类型          | 备注               |
+| -------- | ------------- | ------------------ |
+| 客户ID   | Int64         | 客户ID，厂整型     |
+| 姓       | String        | 客户姓氏，字符串   |
+| 名       | String        | 客户名字，字符串   |
+| 全名     | List\<String> | 客户全程，字符列表 |
+
+地址信息定义：
+
+| 字段名称 | 类型   | 备注 |
+| -------- | ------ | ---- |
+| 街道1    | String |      |
+| 街道2    | String |      |
+| 城市     | String |      |
+| 省份     | String |      |
+| 邮政编码 | String |      |
+| 国家     | String |      |
+
+邮递方式定义：
+
+| 字段名称 | 类型     | 备注 |
+| -------- | -------- | ---- |
+| 普通邮递 | 枚举类型 |      |
+| 宅急送   | 枚举类型 |      |
+| 国际邮递 | 枚举类型 |      |
+| 国内快递 | 枚举类型 |      |
+| 国际快递 | 枚举类型 |      |
+
+### 10.3.2 HTTP+XML协议栈设计
+
+步骤：
+
+1. 构造订购请求消息，将请求消息编码为HTTP+XML格式；
+2. HTTP客户端发起连接，通过HTTP协议栈发送HTTP请求消息；
+3. HTTP服务端对HTTP+XML请求消息进行解码，解码成请求POJO；
+4. 服务端构造应答消息并编码，通过HTTP+XML方式返回给客户端；
+5. 客户端对HTTP+XML响应消息进行解码，解码成响应POJO。
+
+流程分析：
+
+步骤1，需要自定义HTTP+XML格式的请求消息编码器；
+
+步骤2，可重用Netty的能力；
+
+步骤3，Netty可解析HTTP请求消息，但是消息体为XML，Netty无法将其解码为POJO，需要在Netty协议栈的基础上扩展实现。
+
+步骤4，需定制将POJO以XML方式发送
+
+步骤5，需定制解码。
+
+设计思路：
+
+（1）需要一套通用、高性能的XML序列化框架，它能够灵活的实现POJO-XML的互相转换，最好能够通过工具自动生成绑定关系，或者通过XML的方式配置双方的映射关系；
+
+（2）作为通用的HTTP+XML协议栈，XML-POJO的映射关系应该非常灵活，支持命名空间和自定义标签。
+
+（3）一系列HTTP+XML消息编解码器
+
+（4）编解码过程应该对协议栈使用者透明，对上层业务零侵入。
+
+### 10.3.3 高效的XML绑定框架JiBx
+
+1. JiBX入门
+
+专门为Java语言设计的XML数据绑定框架JiBx。
+
+优点：转换效率高、配置绑定文件简单、不需要操作xpath文件、不需要写输行的get/set方法、对象属性名与XML文件element名可以不同等。
+
+绑定XML与Java对象的两个步骤：第一步是绑定XML文件，也就是映射XML文件与Java对象之间的对应关系；第二步是在运行时，实现XML文件与Java势力之间的互相转换。
+
+在运行程序之前，需要先配置绑定文件并进行绑定，在绑定过沉重它将会动态地修改程序中相应地class文件，主要是生成对应对象实例地方法和添加呗绑定标记地输行JiBX_bindingList等。它使用的技术是BCEL(Byte Code Engineering Library)，BCEL是Apache Software Foundation的Jakarta项目的一部分，也是目前Java classworking最广泛使用的一种框架，它可以让你深入JVM汇编语言进行类操作。在JiBX运行时，它使用了目前比较流行的一个技术XPP（Xml Pull Parsing），这也是JiBX如此高效的原因。
+
+XPP：将整个文档写入内存，然后进行DOM操作，也不是使用基于事件流的SAX。XPP使用饿是不断增加的数据流处理方式，同时允许在解析XML文件时中断。
+
+2. POJO对象定义
+
