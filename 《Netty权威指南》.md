@@ -2962,5 +2962,704 @@ public class HttpFileServerHandler extends SimpleChannelInboundHandler<FullHttpR
 
 XPP：将整个文档写入内存，然后进行DOM操作，也不是使用基于事件流的SAX。XPP使用饿是不断增加的数据流处理方式，同时允许在解析XML文件时中断。
 
-2. POJO对象定义
+因书上的项目为Ant打包，与我使用的Maven有冲突，所以开发过程略。
+
+# 第11章 WebSocket协议开发
+
+WebSocket解决的问题：由于HTTP协议的开销，导致它们不合适低延迟应用。
+
+WebSocket将网络套接字引入到了客户端和服务端，浏览器和服务器之间可以通过套接字建立持久的连接，双方随时都可以互发数据给对方，而不是之前由客户端控制的一请求一应答模式。
+
+## 11.1 HTTP协议的弊端
+
+主要弊端如下：
+
+（1）HTTP协议为半双工。可以双向但不能同时。
+
+（2）HTTP消息冗长而繁琐。HTTP消息包含消息头、消息体、换行符等。通常以文本传输，相比于其他二进制通信协议，冗长而繁琐。
+
+（3）针对服务器推送的黑客攻击。例如长时间轮询。
+
+## 11.2 WebSocket入门
+
+H5提供的一种浏览器与服务器间进行全双工通信的网络技术。
+
+在WebSocketAPI中，浏览器和服务器只需要一个握手的动作，然后浏览器和服务器直接就形成了一条快速通道，两者就可以直接互相传送数据了。基于TCP双向全双工进行消息传递。
+
+WebSocket的特点：
+
+- 单一的TCP连接，采用全双工模式通信；
+- 对代理、防火墙和路由器透明；
+- 无头部信息、Cookie和身份验证；
+- 无安全开销；
+- 通过“ping/pong”帧保持链路激活；
+- 服务器可以主动传递消息给客户端，不再需要客户端轮询。
+
+### 11.2.1 WebSocket背景
+
+取代轮询和Comet技术，是客户端浏览器具备像C/S架构下桌面系统一样的实时通信能力。
+
+在流量和负载增大的情况下，WebSocket方案相比传统的AJAX轮询方案有极大的性能优势。
+
+### 11.2.2 WebSocket连接建立
+
+发送一个HTTP请求，与平常的不同，包含一些附加头信息。
+
+返回的也包含附加信息。
+
+### 11.2.3 WebSocket生命周期
+
+握手成功后，就能通过“messages”的方式进行通信了。一个消息由一个或多个帧组成。可以被分割成多个帧或者被合并。
+
+### 11.2.4 WebSocket连接关闭
+
+为关闭WebSocket连接，客户端与服务端需要通过一个安全的方法关闭底层TCP连接以及TLS会话。如果合适，丢弃任何可能已经接收的字节，必要时（比如受到攻击）可以通过任何可用的手段关闭连接。
+
+底层的TCP连接，在正常情况下，应该首先由服务器关闭。在异常情况下（例如在一个合理的时间周期后没有接收到服务器的TCP Close），客户端可以发起TCP Close。因此，当服务器被指示关闭WebSocket连接时，它应该立即发起一个TCP Close操作；客户端应该等待服务器的TCP Close。
+
+WebSocket的握手关闭消息带有一个状态码和一个可选的关闭原因，它必须按照协议要求发送一个Close控制帧，当对端接收到关闭控制帧指令时，需要主动关闭WebSocket连接。
+
+## 11.3 Netty WebSocket协议开发
+
+### 11.3.1 WebSocket服务端功能介绍
+
+支持WebSocket的浏览器通过WebSocket协议发送请求消息给服务端，服务端对请求消息进行判断，如果时合法的WebSocket请求，则获取请求消息体（文本），并在后面追加字符串“欢迎使用Netty WebSocket服务，现在时刻：系统时间”。
+
+客户端HTML通过内嵌的JS脚本创建WebSocket连接，如果握手成功，在文本框中打印“打开WebSocket服务正常。浏览器支持WebSocket！”。
+
+### 11.3.2 WebSocket服务端开发
+
+```java
+package WebSocket.server;
+
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+
+import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.codec.http.HttpServerCodec;
+import io.netty.handler.stream.ChunkedWriteHandler;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/23 13:12
+ */
+
+
+public class WebSocketServer {
+
+    public void run(int port) throws Exception {
+        EventLoopGroup bossGroup = new NioEventLoopGroup();
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+
+        try {
+            ServerBootstrap b = new ServerBootstrap();
+            b.group(bossGroup, workerGroup)
+                    .channel(NioServerSocketChannel.class)
+                    .childHandler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) throws Exception {
+                            ChannelPipeline pipeline = ch.pipeline();
+                            pipeline.addLast("http-codec", new HttpServerCodec());//添加HttpServerCodec，将请求和应答消息编码或者解码为HTTP消息；
+                            pipeline.addLast("aggregator", new HttpObjectAggregator(65536));//添加HttpObjectAggregator，将HTTP消息的多个部分组合成一条完整的HTTP消息
+                            ch.pipeline().addLast("http-chunked", new ChunkedWriteHandler());//向客户端发送H5文件，主要用于支持浏览器和服务端进行WebSocket通信
+                            pipeline.addLast("handler", new WebSocketServerHandler());
+                        }
+                    });
+            Channel ch = b.bind(port).sync().channel();
+            System.out.println("Websocket服务器启动，端口：" + port + '。');
+            System.out.println("浏览器访问"+"http://localhost:"+ port + '/');
+            ch.closeFuture().sync();
+        } finally {
+            bossGroup.shutdownGracefully();
+            workerGroup.shutdownGracefully();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        int port = 8080;
+        if (args.length > 0 ) {
+            try {
+                port = Integer.parseInt(args[0]);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+
+        new WebSocketServer().run(port);
+    }
+}
+
+```
+
+```java
+package WebSocket.server;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.FullHttpRequest;
+import io.netty.handler.codec.http.websocketx.*;
+
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import static io.netty.handler.codec.http.HttpHeaders.isKeepAlive;
+import static io.netty.handler.codec.http.HttpHeaders.setContentLength;
+import static io.netty.handler.codec.http.HttpResponseStatus.BAD_REQUEST;
+import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
+import static io.netty.util.CharsetUtil.UTF_8;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/23 13:33
+ */
+
+
+public class WebSocketServerHandler extends SimpleChannelInboundHandler<Object> {
+
+    private static final Logger logger = Logger.getLogger(WebSocketServerHandler.class.getName());
+    private WebSocketServerHandshaker handshaker;
+
+    @Override
+    protected void messageReceived(ChannelHandlerContext ctx, Object msg) throws Exception {
+        if (msg instanceof FullHttpRequest) {//握手请求
+            handleHttpRequest(ctx, (FullHttpRequest) msg);
+        } else if (msg instanceof WebSocketFrame) {
+            handleWebSocketFrame(ctx, (WebSocketFrame) msg);
+        }
+    }
+
+
+    private void handleHttpRequest(ChannelHandlerContext ctx, FullHttpRequest req) {
+        if (!req.getDecoderResult().isSuccess() || (!"websocket".equals(req.headers().get("Upgrade")))) {
+            sendHttpResponse(ctx, req, new DefaultFullHttpResponse(HTTP_1_1, BAD_REQUEST));//如果不是握手请求就返回400；
+            return;
+        }
+
+        //构造握手工厂
+        WebSocketServerHandshakerFactory wsFactory = new WebSocketServerHandshakerFactory("ws://localhost:8080/socket", null, false);
+        //握手处理类
+        handshaker = wsFactory.newHandshaker(req);
+        if (handshaker == null) {
+            WebSocketServerHandshakerFactory.sendUnsupportedWebSocketVersionResponse(ctx.channel());
+        } else {
+            handshaker.handshake(ctx.channel(), req);
+        }
+    }
+
+    private void sendHttpResponse(ChannelHandlerContext ctx, FullHttpRequest req, DefaultFullHttpResponse resp) {
+        if (resp.getStatus().code() != 200) {
+            ByteBuf buf = Unpooled.copiedBuffer(resp.getStatus().toString(), UTF_8);
+            resp.content().writeBytes(buf);
+            buf.release();
+            setContentLength(resp, resp.content().readableBytes());
+        }
+
+        ChannelFuture f =ctx.channel().writeAndFlush(resp);
+        if (!isKeepAlive(req) || resp.getStatus().code() != 200) {
+            f.addListener(ChannelFutureListener.CLOSE);
+        }
+    }
+
+    private void handleWebSocketFrame(ChannelHandlerContext ctx, WebSocketFrame frame) {
+        if (frame instanceof CloseWebSocketFrame) {
+            handshaker.close(ctx.channel(), ((CloseWebSocketFrame) frame).retain());
+            return;
+        }
+
+        if (frame instanceof PingWebSocketFrame) {
+            ctx.channel().write(new PongWebSocketFrame(frame.content().retain()));
+            return;
+        }
+
+        if (!(frame instanceof TextWebSocketFrame)) {
+            throw new UnsupportedOperationException(String.format("%s frame types not supported", frame.getClass().getName()));
+        }
+
+        String request = ((TextWebSocketFrame) frame).text();
+        logger.info(request);
+        if (logger.isLoggable(Level.FINE)) {
+            logger.fine(String.format("%s received %s", ctx.channel(), request));
+        }
+
+        ctx.channel().write(
+                new TextWebSocketFrame(request
+                        + " , 欢迎使用Netty WebSocket服务，现在时刻："
+                        + new java.util.Date().toString()));
+    }
+
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        ctx.flush();
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        cause.printStackTrace();
+        ctx.close();
+    }
+}
+
+```
+
+WebSocket本身非常复杂，可以通过多种形式（文本方式，二进制方式）承载信息。
+
+# 第12章 私有协议栈开发
+
+私有协议灵活，在公司内部或组织内部使用。
+
+绝大多数私有协议传输层采用TCP/IP。
+
+## 12.1 私有协议介绍
+
+除非授权，不然其他厂商无法使用。私有协议也称非标准协议。
+
+传统的Java应用中，通常使用以下4中方式进行跨节点通信：
+
+（1）通过RMI进行远程服务调用；
+
+（2）通过Java的Socket+Java序列化的方式进行跨节点调用；
+
+（3）利用一些开源的RPC框架进行远程服务嗲用，如Facebook的Thrift、Apache的Avro等；
+
+（4）利用标准的公有协议进行跨节点调用，例如HTTP+XML、RESTful+JSON或者WebService。
+
+私有协议：链路层的物理连接，对请求和响应消息进行编码，在请求和应答消息本身以外，也需要携带一些其他控制和管理类指令，例如链路建立的握手请求和响应消息、链路检测的心跳消息等。
+
+并没有标准的定义，只要能够用于跨进程、跨主机数据交换的非标准协议，都可以称为私有协议。
+
+## 12.2 Netty协议栈功能设计
+
+用于内部各模块之间的通信， 它基于TCP/IP协议栈，是一个类HTTP协议的应用层协议栈。
+
+### 12.1.1 网络拓扑图
+
+无固定客户端，服务端。谁发起谁就是客户端，接收时服务端。
+
+### 12.2.2 协议栈功能描述
+
+（1）基于Netty的NIO通信框架，提供高性能饿异步通信能力；
+
+（2）提供消息的编解码框架，可以实现POJO的序列化和反序列化；
+
+（3）提供基于IP地址的白名单接入认证机制；
+
+（4）链路的有效性检验机制；
+
+（5）链路的断连重连机制。
+
+### 12.2.3 通信模型
+
+具体步骤：
+
+（1）Netty协议栈客户端发送握手请求消息，携带节点ID等有效身份认证信息；
+
+（2）Netty协议栈服务端对握手请求消息进行合法性校验，包括节点ID有效性校验、节点重复登录校验和IP地址合法性校验，校验通过后，返回登录成功的握手应答消息；
+
+（3）链路建立成功之后，客户端发送业务；
+
+（4）链路成功之后，服务端发送心跳信息；
+
+（5）链路建立成功之后，客户端法统心跳信息；
+
+（6）链路建立成功之后，服务端发送业务消息；
+
+（7）服务端退出时，服务端关闭连接，客户端感知对方关闭连接后，被动关闭客户端连接。
+
+### 12.2.4 消息定义
+
+两部分：
+
+- 消息头；
+- 消息体。
+
+协议详细描述部分不赘述，因为是私有协议，内容不重要，开发过程才是重点，之后看Dubbo在着重看协议内容。
+
+### 12.3 Netty协议栈开发
+
+### 12.3.1 数据结构定义
+
+```java
+package PrivateProtocol.struct;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/23 14:49
+ */
+
+
+public class NettyMessage {
+
+    private Header header;//消息头
+    private Object body;//消息体
+
+    public Header getHeader() {
+        return header;
+    }
+
+    public void setHeader(Header header) {
+        this.header = header;
+    }
+
+    public Object getBody() {
+        return body;
+    }
+
+    public void setBody(Object body) {
+        this.body = body;
+    }
+
+    @Override
+    public String toString() {
+        return "NettyMessage{" +
+                "header=" + header +
+                ", body=" + body +
+                '}';
+    }
+}
+
+```
+
+```java
+package PrivateProtocol.struct;
+
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/23 14:50
+ */
+
+
+public class Header {
+
+    private int crcCode = 0xabef0101;
+    private int length;//消息长度
+    private long sessionID;//会话ID
+    private byte type;//消息类型
+    private byte priority;//消息优先级
+    private Map<String, Object> attachment = new HashMap<String, Object>();//附件
+
+    public int getCrcCode() {
+        return crcCode;
+    }
+
+    public void setCrcCode(int crcCode) {
+        this.crcCode = crcCode;
+    }
+
+    public int getLength() {
+        return length;
+    }
+
+    public void setLength(int length) {
+        this.length = length;
+    }
+
+    public long getSessionID() {
+        return sessionID;
+    }
+
+    public void setSessionID(long sessionID) {
+        this.sessionID = sessionID;
+    }
+
+    public byte getType() {
+        return type;
+    }
+
+    public void setType(byte type) {
+        this.type = type;
+    }
+
+    public byte getPriority() {
+        return priority;
+    }
+
+    public void setPriority(byte priority) {
+        this.priority = priority;
+    }
+
+    public Map<String, Object> getAttachment() {
+        return attachment;
+    }
+
+    public void setAttachment(Map<String, Object> attachment) {
+        this.attachment = attachment;
+    }
+
+    @Override
+    public String toString() {
+        return "Header{" +
+                "crcCode=" + crcCode +
+                ", length=" + length +
+                ", sessionID=" + sessionID +
+                ", type=" + type +
+                ", priority=" + priority +
+                ", attachment=" + attachment +
+                '}';
+    }
+}
+
+```
+
+由于心跳消息、握手请求和握手应答消息都可以统一由NettyMessage承载，所以不需要为这几类控制消息做单独的数据结构定义。
+
+### 12.3.2 消息编解码
+
+```java
+package PrivateProtocol.codec;
+
+import PrivateProtocol.struct.NettyMessage;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.MessageToByteEncoder;
+
+
+import java.io.IOException;
+import java.util.Map;
+
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/23 14:59
+ */
+
+
+public class NettyMessageEncoder extends MessageToByteEncoder<NettyMessage> {
+
+    MarshallingEncoder marshallingEncoder;
+    public NettyMessageEncoder() throws IOException{
+        this.marshallingEncoder = new MarshallingEncoder();
+    }
+
+    @Override
+    protected void encode(ChannelHandlerContext ctx, NettyMessage msg, ByteBuf sendBuf) throws Exception {
+        if (msg == null || msg.getHeader() == null) {
+            throw new Exception("The encode message is null");
+        }
+        sendBuf.writeInt(msg.getHeader().getCrcCode());
+        sendBuf.writeInt(msg.getHeader().getLength());
+        sendBuf.writeLong(msg.getHeader().getSessionID());
+        sendBuf.writeByte(msg.getHeader().getType());
+        sendBuf.writeByte(msg.getHeader().getPriority());
+        sendBuf.writeInt(msg.getHeader().getAttachment().size());
+
+        String key = null;
+        byte[] keyArray = null;
+        Object value = null;
+        for (Map.Entry<String, Object> param : msg.getHeader().getAttachment().entrySet()) {
+            key = param.getKey();
+            keyArray = key.getBytes("UTF-8");
+            sendBuf.writeInt(keyArray.length);
+            sendBuf.writeBytes(keyArray);
+            value = param.getValue();
+            marshallingEncoder.encode(value, sendBuf);
+        }
+
+        key = null;
+        keyArray = null;
+        value = null;
+        if (msg.getBody() != null) {
+            marshallingEncoder.encode(msg.getBody(), sendBuf);
+        } else
+            sendBuf.writeInt(0);
+        sendBuf.setInt(4, sendBuf.readableBytes() - 8);
+    }
+}
+
+```
+
+```java
+package PrivateProtocol.codec;
+
+import io.netty.buffer.ByteBuf;
+import org.jboss.marshalling.Marshaller;
+
+import java.io.IOException;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/23 15:06
+ */
+
+
+public class MarshallingEncoder {
+
+    private static final byte[] LENGTH_PLACEHOLDER = new byte[4];
+
+    Marshaller marshaller;
+
+    public MarshallingEncoder() throws IOException {
+        marshaller = MarshallingCodecFactory.buildMarshalling();
+    }
+
+
+    public void encode(Object msg, ByteBuf out) throws IOException {
+        try {
+            int lengthPos = out.writerIndex();
+            out.writeBytes(LENGTH_PLACEHOLDER);
+            ChannelBufferByteOutput output = new ChannelBufferByteOutput(out);
+            marshaller.start(output);
+            marshaller.writeObject(msg);
+            marshaller.finish();
+            out.setInt(lengthPos, out.writerIndex() - lengthPos - 4);
+        } finally {
+            marshaller.close();
+        }
+    }
+}
+
+```
+
+```java
+package PrivateProtocol.codec;
+
+
+import PrivateProtocol.struct.Header;
+import PrivateProtocol.struct.NettyMessage;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
+
+import java.io.IOException;
+import java.nio.ByteOrder;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/23 15:36
+ */
+
+/*
+ *Netty的LengthFieldBasedFrameDecoder解码器，它支持自动的TCP粘包和半包处理，
+ *只需要给出标识消息长度饿字段偏移量和消息长度自身所占的字节数，Netty就能自动实现对半包的处理。
+ */
+public class NettyMessageDecoder extends LengthFieldBasedFrameDecoder {
+    MarshallingDecoder marshallingDecoder;
+
+
+    public NettyMessageDecoder(int maxFrameLength, int lengthFieldOffset, int lengthFieldLength) throws IOException {
+        super(maxFrameLength, lengthFieldOffset, lengthFieldLength);
+        marshallingDecoder = new MarshallingDecoder();
+    }
+
+    @Override
+    protected Object decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+        ByteBuf frame = (ByteBuf) super.decode(ctx, in);
+        if (frame == null) {
+            return null;
+        }
+
+        NettyMessage message = new NettyMessage();
+        Header header = new Header();
+        header.setCrcCode(frame.readInt());
+        header.setLength(frame.readInt());
+        header.setSessionID(frame.readLong());
+        header.setType(frame.readByte());
+        header.setPriority(frame.readByte());
+
+        int size = frame.readInt();
+        if (size > 0) {
+            Map<String, Object> attch = new HashMap<String, Object>(size);
+            int keySize = 0;
+            byte[] keyArray = null;
+            String key = null;
+            for (int i = 0; i < size; i++) {
+                keySize = frame.readInt();
+                keyArray = new byte[keySize];
+                frame.readBytes(keyArray);
+                key = new String(keyArray, "UTF-8");
+                attch.put(key, marshallingDecoder.decode(frame));
+            }
+            keyArray = null;
+            key = null;
+            header.setAttachment(attch);
+        }
+        if (frame.readableBytes() > 4) {
+            message.setBody(marshallingDecoder.decode(frame));
+        }
+        message.setHeader(header);
+        return message;
+    }
+}
+
+```
+
+```java
+package PrivateProtocol.codec;
+
+import io.netty.buffer.ByteBuf;
+import org.jboss.marshalling.ByteInput;
+import org.jboss.marshalling.Unmarshaller;
+
+import java.io.IOException;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/23 15:47
+ */
+
+
+public class MarshallingDecoder {
+
+    private final Unmarshaller unmarshaller;
+
+    public MarshallingDecoder() throws IOException {
+        unmarshaller = MarshallingCodecFactory.buildUnMarshalling();
+    }
+
+    protected Object decode(ByteBuf in) throws Exception {
+        int objectSize = in.readInt();
+        ByteBuf buf = in.slice(in.readerIndex(), objectSize);
+        ByteInput input = new ChannelBufferByteInput(buf);
+        try {
+            unmarshaller.start(input);
+            Object obj = unmarshaller.readObject();
+            unmarshaller.finish();
+            in.readerIndex(in.readerIndex() + objectSize);
+            return obj;
+        } finally {
+            unmarshaller.close();
+        }
+    }
+}
+
+```
 
