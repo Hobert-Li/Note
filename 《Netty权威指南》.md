@@ -3663,3 +3663,485 @@ public class MarshallingDecoder {
 
 ```
 
+### 12.3.3 握手和安全验证
+
+```java
+package PrivateProtocol.client;
+
+import PrivateProtocol.struct.Header;
+import PrivateProtocol.struct.NettyMessage;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
+import java.awt.*;
+
+import static PrivateProtocol.common.MessageType.LOGIN_REQ;
+import static PrivateProtocol.common.MessageType.LOGIN_RESP;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/23 16:08
+ */
+
+
+public class LoginAuthReqHandler extends ChannelHandlerAdapter {
+
+    private static final Log LOG = LogFactory.getLog(LoginAuthReqHandler.class);
+
+    //TCP连接三次握手成功之后又客户端构造握手请求消息发送给服务端，由于采用白名单认证机制，不需要携带消息体。
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) throws Exception {
+        ctx.writeAndFlush(buildLoginReq());
+    }
+
+    //对我收应答消息进行处理
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+
+        NettyMessage message = (NettyMessage) msg;
+
+        if (message.getHeader() != null && message.getHeader().getType() == LOGIN_RESP.value()) {
+            byte loginResult = (byte) message.getBody();
+            //非0则认证失败，关闭链路
+            if (loginResult != (byte) 0) {
+                ctx.close();
+            } else {
+                LOG.info("Login is ok：" + message);
+                ctx.fireChannelRead(msg);
+            }
+        } else {
+            //不是握手应答消息，传递给后面的ChannelHandler处理
+            ctx.fireChannelRead(msg);
+        }
+
+    }
+
+    private NettyMessage buildLoginReq() {
+        NettyMessage message = new NettyMessage();
+        Header header = new Header();
+        header.setType(LOGIN_REQ.value());
+        message.setHeader(header);
+        return message;
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        ctx.fireExceptionCaught(cause);
+    }
+}
+
+```
+
+```java
+package PrivateProtocol.server;
+
+import PrivateProtocol.struct.Header;
+import PrivateProtocol.struct.NettyMessage;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import static PrivateProtocol.common.MessageType.LOGIN_REQ;
+import static PrivateProtocol.common.MessageType.LOGIN_RESP;
+
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/23 15:56
+ */
+
+
+public class LoginAuthRespHandler extends ChannelHandlerAdapter {
+
+    public final static Log LOG = LogFactory.getLog(LoginAuthRespHandler.class);
+
+    //重复登录保护
+    private Map<String, Boolean> nodeCheck = new ConcurrentHashMap<String, Boolean>();
+
+    //白名单
+    private String[] whitekList = {"127.0.0.1", InetAddress.getLocalHost().getHostAddress()};
+
+    public LoginAuthRespHandler() throws UnknownHostException {
+    }
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        NettyMessage message = (NettyMessage) msg;
+
+        if (message.getHeader() != null && message.getHeader().getType() == LOGIN_REQ.value()) {
+            String nodeIndex = ctx.channel().remoteAddress().toString();
+            NettyMessage loginResp = null;
+
+            if (nodeCheck.containsKey(nodeIndex)) {
+                loginResp = buildResponse((byte)-1);
+            } else {
+                InetSocketAddress address = (InetSocketAddress) ctx.channel().remoteAddress();
+                String ip = address.getAddress().getHostAddress();
+                boolean isOK = false;
+                for (String WIP : whitekList) {
+                    if (WIP.equals(ip)) {
+                        isOK = true;
+                        break;
+                    }
+                }
+                loginResp = isOK ? buildResponse((byte)0) : buildResponse((byte)-1);
+                if (isOK) {
+                    nodeCheck.put(nodeIndex, true);
+                }
+                LOG.info("The login response is : " + loginResp
+                        + " body [" + loginResp.getBody() + "]");
+                ctx.writeAndFlush(loginResp);
+            }
+        } else {
+            ctx.fireChannelRead(msg);
+        }
+    }
+
+    private NettyMessage buildResponse(byte result) {
+        NettyMessage message = new NettyMessage();
+        Header header = new Header();
+        header.setType(LOGIN_RESP.value());
+        message.setHeader(header);
+        message.setBody(result);
+        return message;
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        cause.printStackTrace();
+        //出现异常时需要去注册，保证后续客户端可以重连成功
+        nodeCheck.remove(ctx.channel().remoteAddress().toString());
+        ctx.close();
+        ctx.fireExceptionCaught(cause);
+    }
+}
+
+```
+
+### 12.3.4 心跳检测机制
+
+```java
+package PrivateProtocol.client;
+
+import PrivateProtocol.struct.Header;
+import PrivateProtocol.struct.NettyMessage;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+import static PrivateProtocol.common.MessageType.*;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/26 10:36
+ */
+
+
+public class HeartBeatReqHandler extends ChannelHandlerAdapter {
+
+    private static final Log LOG = LogFactory.getLog(HeartBeatReqHandler.class);
+
+    private volatile ScheduledFuture<?> heartBeat;
+
+    //握手成功后启动无限循环定时器用于定期发送心跳消息
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        NettyMessage message = (NettyMessage) msg;
+        if (message.getHeader() != null && message.getHeader().getType() == LOGIN_RESP.value()) {
+            //每5秒发送一条心跳消息
+            heartBeat = ctx.executor().scheduleAtFixedRate(
+                    new HeartBeatTask(ctx), 0, 5000, TimeUnit.MILLISECONDS
+            );
+            //处理服务端发送的心跳应答消息
+        } else if (message.getHeader() != null && message.getHeader().getType() == HEARTBEAT_RESP.value()) {
+            LOG.info("Client receive server heart beat message : ---> " + message);
+        } else {
+            ctx.fireChannelRead(msg);
+        }
+    }
+
+    private class HeartBeatTask implements Runnable {
+
+        private final ChannelHandlerContext ctx;
+
+        private HeartBeatTask(ChannelHandlerContext ctx) {
+            this.ctx = ctx;
+        }
+
+        @Override
+        public void run() {
+            NettyMessage heartBeat = buildHeartBeat();
+            LOG.info("Client send heart beat messsage to server : ---> " + heartBeat);
+            ctx.writeAndFlush(heartBeat);
+        }
+
+        private NettyMessage buildHeartBeat() {
+            NettyMessage message = new NettyMessage();
+            Header header = new Header();
+            header.setType(HEARTBEAT_REQ.value());
+            message.setHeader(header);
+            return message;
+        }
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        cause.printStackTrace();
+        if (heartBeat != null) {
+            heartBeat.cancel(true);
+            heartBeat = null;
+        }
+
+        ctx.fireExceptionCaught(cause);
+    }
+}
+
+```
+
+```java
+package PrivateProtocol.server;
+
+import PrivateProtocol.struct.Header;
+import PrivateProtocol.struct.NettyMessage;
+import io.netty.channel.ChannelHandlerAppender;
+import io.netty.channel.ChannelHandlerContext;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
+import static PrivateProtocol.common.MessageType.HEARTBEAT_REQ;
+import static PrivateProtocol.common.MessageType.HEARTBEAT_RESP;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/26 10:55
+ */
+
+
+public class HeartBeatRespHandler extends ChannelHandlerAppender {
+    private static final Log LOG = LogFactory.getLog(HeartBeatRespHandler.class);
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        NettyMessage message = (NettyMessage) msg;
+        if (message.getHeader() != null && message.getHeader().getType() == HEARTBEAT_REQ.value()) {
+            LOG.info("Receive client heart beat message : ---> " + message);
+            NettyMessage heartBeat = buildHeatBeat();
+            LOG.info("Send heart beat response message to client : ---> " + heartBeat);
+            ctx.writeAndFlush(heartBeat);
+        } else {
+            ctx.fireChannelRead(msg);
+        }
+    }
+
+    private NettyMessage buildHeatBeat() {
+        NettyMessage message = new NettyMessage();
+        Header header = new Header();
+        header.setType(HEARTBEAT_RESP.value());
+        message.setHeader(header);
+        return message;
+    }
+}
+
+```
+
+### 12.3.5 断线重连
+
+```java
+package PrivateProtocol.client;
+
+import PrivateProtocol.codec.NettyMessageDecoder;
+import PrivateProtocol.codec.NettyMessageEncoder;
+import PrivateProtocol.common.NettyConstant;
+import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
+import java.net.InetSocketAddress;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import static PrivateProtocol.common.NettyConstant.*;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/26 11:04
+ */
+
+
+public class NettyClient {
+
+    private static final Log LOG = LogFactory.getLog(NettyClient.class);
+
+    private ScheduledExecutorService executor = Executors.newScheduledThreadPool(1);
+
+    EventLoopGroup group = new NioEventLoopGroup();
+
+    public void connect(int port, String host) throws Exception {
+
+        try {
+            Bootstrap b = new Bootstrap();
+
+            b.group(group)
+                    .channel(NioSocketChannel.class)
+                    .option(ChannelOption.TCP_NODELAY, true)
+                    .handler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) throws Exception {
+                            //消息解码，并设置了最大长度上限
+                            ch.pipeline().addLast(new NettyMessageDecoder(1024 * 1024, 4, 4));
+                            //消息编码
+                            ch.pipeline().addLast("MessageEncoder", new NettyMessageEncoder());
+                            //读超时
+                            ch.pipeline().addLast("readTimeoutHandler", new ReadTimeoutHandler(50));
+                            //握手请求
+                            ch.pipeline().addLast("LoginAuthHandler", new LoginAuthReqHandler());
+                            //心跳消息
+                            ch.pipeline().addLast("HeartBeatHandler", new HeartBeatReqHandler());
+
+                            //类似于AOP但比AOP性能更高。
+                        }
+                    });
+
+
+            //ChannelFuture f = b.connect(new InetSocketAddress(host, port),
+                    //new InetSocketAddress(LOCALIP, LOCAL_PORT)).sync();
+            ChannelFuture f = b.connect("127.0.0.1", 8080).sync();
+            f.channel().closeFuture().sync();
+        } finally {
+            executor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        TimeUnit.SECONDS.sleep(1);
+                        try {
+                            connect(PORT, REMOTEIP);//发起重连操作
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+            });
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        new NettyClient().connect(PORT, REMOTEIP);
+    }
+}
+
+```
+
+```java
+package PrivateProtocol.server;
+
+import PrivateProtocol.codec.NettyMessageDecoder;
+import PrivateProtocol.codec.NettyMessageEncoder;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.logging.LogLevel;
+import io.netty.handler.logging.LoggingHandler;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
+import static PrivateProtocol.common.NettyConstant.PORT;
+import static PrivateProtocol.common.NettyConstant.REMOTEIP;
+
+/**
+ * <p>Description:  xx</p>
+ *
+ * @author 李宏博
+ * @version 1.0
+ * @create 2019/8/26 11:23
+ */
+
+
+public class NettyServer {
+
+    private static final Log LOG = LogFactory.getLog(NettyServer.class);
+
+    public void bind() throws Exception {
+
+        EventLoopGroup bossGroup = new NioEventLoopGroup();
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+
+        ServerBootstrap b = new ServerBootstrap();
+
+        b.group(bossGroup, workerGroup)
+                .channel(NioServerSocketChannel.class)
+                .option(ChannelOption.SO_BACKLOG, 100)
+                .handler(new LoggingHandler(LogLevel.INFO))
+                .childHandler(new ChannelInitializer<SocketChannel>() {
+                    @Override
+                    protected void initChannel(SocketChannel ch) throws Exception {
+                        ch.pipeline().addLast(new NettyMessageDecoder(1024 * 1024, 4, 4));
+                        ch.pipeline().addLast(new NettyMessageEncoder());
+                        ch.pipeline().addLast(new ReadTimeoutHandler(50));
+                        ch.pipeline().addLast(new LoginAuthRespHandler());
+                        ch.pipeline().addLast(new HeartBeatRespHandler());
+                    }
+                });
+        b.bind(REMOTEIP, PORT).sync();
+        LOG.info("Netty server start ok : "
+                + (REMOTEIP + " : " + PORT));
+    }
+
+    public static void main(String[] args) throws Exception {
+        new NettyServer().bind();
+    }
+
+}
+```
+
+## 12.5 总结
+
+协议栈还有很多缺陷，比如断线后，发送的消息保存在哪里？
+
+# 之后的章节
+
+源码就不记录了，详细看这个https://www.javadoop.com/post/netty-part-1
