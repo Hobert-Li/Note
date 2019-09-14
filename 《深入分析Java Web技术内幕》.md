@@ -8,7 +8,17 @@
 
 ## 6.1 ClassLoader类结构解析
 
+defineClass方法：将byte字节流解析成JVM能够识别的Class对象。意味着不仅仅可以通过class文件实例化对象。调用此方法生成的Class对象还没有resolve，resolve会在对象真正实例化时才进行。
 
+findClass方法：通过直接覆盖ClassLoader父类的findClass方法来实现类的加载规则，从而取得要加载的字节码。然后调用defineClass方法生成类的Class对象。如果想在类被加载到JVM的时候就被链接（Link），那么可以接着调用另外一个resolveClass方法。
+
+如果想实现自己的ClassLader，一般都会继承URLClassLoader。
+
+## 6.2 ClassLoader的等级加载机制
+
+双亲委派。
+
+（1）Bootstrap ClassLoader，主要加载JVM自身工作需要的类，完全由JVM自己控制。（既没有更高一级的父加载器，也没有子加载器）。
 
 
 
