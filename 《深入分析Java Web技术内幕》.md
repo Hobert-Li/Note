@@ -20,7 +20,23 @@ findClass方法：通过直接覆盖ClassLoader父类的findClass方法来实现
 
 （1）Bootstrap ClassLoader，主要加载JVM自身工作需要的类，完全由JVM自己控制。（既没有更高一级的父加载器，也没有子加载器）。
 
+（2）ExtClassLoader，并不是JVM亲自实现，加载System.getProperty(“java.ext.dirs”)目录下的类。
 
+![1569483081242](assets/1569483081242.png)
+
+（3）AppClassLoader，父类是ExtClassLoader。加载System.getProperty(“java.class.path”)目录下的类都可以被其加载。
+
+实现自己的类加载器，都必须最终调用getSystemClassLoader()作为父加载器。而此方法获取到的就是AppClassLoader。
+
+注意Bootstrap ClassLoader并不是如其他文章所说，而是其并无子类也无父类。ExtClassLoader并没有父类加载器。
+
+ExtClassLoader和AppClassLoader都继承了URLClassloader类，而URLClassLoader又实现了抽象类ClassLoader，在创建Launcher对象时会首先创建ExtClassLoader，然后讲ExtClassLoader对象作为父加载器创建AppClassLoader对象。所以如果在Java应用中没有定义其他的ClassLoader，那么除了System.getProperty(“java.ext.dirs”)目录下的类是由ExtClassloader加载，其他类都是由AppClassLoader加载。
+
+加载class文件到内存的两种方式：隐式，显式。
+
+## 6.3 如何加载class文件
+
+加载、验证、准备、解析、初始化。
 
 
 
